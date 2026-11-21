@@ -252,8 +252,30 @@ def _classify(node, name):
         if isinstance(tgt, ast.Name):
             return ("local", tgt.id)
     if _is_callarg(node):
+        if _bool_context(node):
+            return ("truth", None)
         return ("callarg", None)
+    if _bool_context(node):
+        return ("truth", None)
     return ("opaque", None)
+
+
+def _bool_context(node):
+    """Whether only the truth of the value is used (`if X`, `not X`, `bool(X or Y)`):
+    for a dict or set that depends on its size alone."""
+    child, p = node, getattr(node, "_br_parent", None)
+    while isinstance(p, ast.BoolOp):
+        child, p = p, getattr(p, "_br_parent", None)
+    if isinstance(p, (ast.If, ast.While, ast.IfExp, ast.Assert)) and p.test is child:
+        return True
+    if isinstance(p, ast.UnaryOp) and isinstance(p.op, ast.Not):
+        return True
+    if isinstance(p, ast.comprehension) and child in p.ifs:
+        return True
+    if isinstance(p, ast.Call) and isinstance(p.func, ast.Name) and p.func.id == "bool" and \
+            len(p.args) == 1 and p.args[0] is child:
+        return True
+    return False
 
 
 def _is_callarg(node):
@@ -375,11 +397,12 @@ class Narrower:
     def recorded(self, attr):
         return self.keymap is not None and attr in self.keymap["names"]
 
-    def opaque_bits(self, attr):
+    def opaque_bits(self, attr, resize=True):
         """Tests that read `attr` other than key by key (or, when the key map was
-        recorded for it, other than through a recording site)."""
+        recorded for it, other than through a recording site).  A read of its truth
+        only counts when the change can alter its size."""
         rec = self.recorded(attr)
-        k = ("opq", attr, rec)
+        k = ("opq", attr, rec, resize)
         if k in self.memo:
             return self.memo[k]
         names = (attr,) + ALIASES.get(attr, ())
@@ -388,7 +411,7 @@ class Narrower:
         for p, lines, kind, _alias in self.src.occurrences(set(names[:1])) + \
                 self.src.occurrences(set(names[1:]), attr_only=True):
             seen.setdefault(p, set()).update(lines)
-            if kind == "opaque" or (kind == "callarg" and not rec) or \
+            if kind == "opaque" or (kind == "callarg" and not rec) or (kind == "truth" and resize) or \
                     (kind == "deftime" and p.startswith("tests/")):
                 b |= self.call_bits(p, lines)
         # the name written some other way (a string, getattr(x, "NAME")): no telling how it is read
@@ -400,11 +423,13 @@ class Narrower:
         self.memo[k] = b
         return b
 
-    def key_bits(self, attr, key_repr):
+    def key_bits(self, attr, key_repr, resize=True):
         b = self.unrecorded
         for name in (attr,) + ALIASES.get(attr, ()):
             km = self.keymap["keys"].get(name, {})
             b |= km.get(key_repr, 0) | km.get("*", 0)
+            if resize:
+                b |= km.get("#len", 0)
         return b
 
     def compute(self, entries):
@@ -427,11 +452,12 @@ class Narrower:
                     bits |= self.call_bits(p, lines)
             module_level = ":" not in e["where"]
             if keyed and self.recorded(attr):
-                bits |= self.key_bits(attr, key[-1] if key[0] == "other" else key[3])
+                resize = e.get("resize", True)
+                bits |= self.key_bits(attr, key[-1] if key[0] == "other" else key[3], resize)
                 if key[0] == "class":
                     for c in [key[1]] + list(key[2]):
                         bits |= self.mp.cls_bits.get(c, 0)
-                bits |= self.opaque_bits(attr)
+                bits |= self.opaque_bits(attr, resize)
                 bits |= self.dyn_bits(attr, module_level)
                 continue
             if keyed and key[0] == "class":

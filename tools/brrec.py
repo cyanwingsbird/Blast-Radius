@@ -51,8 +51,13 @@ def _mk(base, keyed):
     for m in keyed:
         if hasattr(base, m):
             ns[m] = keyed_method(m)
+
+    def __len__(self):
+        REC.add((self._br_n, "#len"))     # size (and truthiness) only
+        return len(self._br_v)
+    ns["__len__"] = __len__
     for m in dir(base):
-        if m in ns or m in keyed or m in ("__new__", "__init__", "__getattribute__", "__setattr__", "__delattr__",
+        if m in ns or m in keyed or m in ("__len__", "__new__", "__init__", "__getattribute__", "__setattr__", "__delattr__",
                                            "__class__", "__init_subclass__", "__subclasshook__", "__class_getitem__",
                                            "fromkeys", "__doc__", "__slots__", "__dir__", "__format__",
                                            "__getstate__", "__reduce__", "__reduce_ex__", "__sizeof__"):

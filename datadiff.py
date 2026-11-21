@@ -406,5 +406,8 @@ def describe(raw, root):
             fl.append((f[len(root):] if f.startswith(root) else None, sorted(_all_lines(c))))
         if fl:
             e["func_lines"] = fl
+        if key is not None:
+            # a value changed under a key both sides have: the dict keeps its size
+            e["resize"] = va is _MISSING or vb is _MISSING
         out.append(e)
     return out
