@@ -709,7 +709,7 @@ class Warm:
         self.exec_cache = None
         if "tests/test_executor.py" in test_files:
             try:
-                self.exec_cache = _build_exec_cache()
+                self.exec_cache = _load_exec_cache() or _build_exec_cache()
             except Exception:
                 self.exec_cache = None
         self.refs = None
@@ -893,6 +893,40 @@ class _NoConn:
 
     def close(self):
         pass
+
+
+EXEC_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "execcache.pickle")
+
+
+def _load_exec_cache():
+    """The executor tables, built from the pinned commit while the image was built."""
+    try:
+        with open(EXEC_CACHE_FILE, "rb") as f:
+            data = f.read()
+        enabled = gc.isenabled()
+        gc.disable()
+        try:
+            cache = pickle.loads(data)
+        finally:
+            if enabled:
+                gc.enable()
+        if cache.pop("root", None) != os.path.realpath(ROOT):
+            return None
+        return cache
+    except Exception:
+        return None
+
+
+def save_exec_cache(path=EXEC_CACHE_FILE):
+    """Build time: run the executor tests' setup once and store what it builds."""
+    if ROOT not in sys.path:
+        sys.path.insert(0, ROOT)
+    os.chdir(ROOT)
+    _limit_duckdb_threads()
+    cache = _build_exec_cache()
+    cache["root"] = os.path.realpath(ROOT)
+    with open(path, "wb") as f:
+        pickle.dump(cache, f, protocol=5)
 
 
 def _build_exec_cache():

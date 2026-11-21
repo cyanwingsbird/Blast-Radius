@@ -24,6 +24,8 @@ os.rename('/opt/sqlglot-${SQLGLOT_SHA}', '/opt/sqlglot')" \
 
 COPY selector.py analyze.py runner.py costs.json map.bin probes.bin casemap.bin callmap.bin /app/
 RUN chmod -R a+rX /app && PYTHONDONTWRITEBYTECODE= python -m compileall -q /app
+# the executor tests' tables, built once from the pinned commit (the run falls back to building them)
+RUN cd /app && python -c "import runner; runner.save_exec_cache()" ; chmod a+r /app/execcache.pickle || true
 
 WORKDIR /app
 CMD ["python", "/app/selector.py"]
