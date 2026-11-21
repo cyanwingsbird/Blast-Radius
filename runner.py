@@ -486,6 +486,18 @@ def _module_refs(loaded, registry):
     """For every loaded module: the names of the modules its globals point into
     (through classes, their bases and attributes, containers and defaults)."""
     names = set(loaded)
+    containers = (dict, list, tuple, set, frozenset)
+    # module-level data objects (and what they directly hold) belong to their module:
+    # another module holding one of them shares data with it
+    owner = {}
+    for n, m in loaded.items():
+        for k, v in list(vars(m).items()):
+            if isinstance(v, containers) and v:
+                owner.setdefault(id(v), n)
+                items = list(v.values()) if isinstance(v, dict) else list(v)[:5000]
+                for x in items:
+                    if isinstance(x, containers) and x:
+                        owner.setdefault(id(x), n)
 
     def add(out, mod):
         if mod in names:
@@ -495,6 +507,9 @@ def _module_refs(loaded, registry):
         if id(v) in seen:
             return
         seen.add(id(v))
+        o = owner.get(id(v))
+        if o is not None:
+            out.add(o)
         if isinstance(v, types.ModuleType):
             add(out, v.__name__)
             return
@@ -531,6 +546,8 @@ def _module_refs(loaded, registry):
         out = set()
         seen = set()
         for k, v in list(vars(m).items()):
+            if isinstance(v, types.ModuleType) and v.__name__.startswith(n + "."):
+                continue      # a package's own submodule: handled by scrubbing, not a dependency
             walk(v, out, 0, seen)
         out.discard(n)
         refs[n] = out
@@ -556,13 +573,20 @@ def _partial_purge(changed, refs):
     except Exception:
         return False
     is_pkg = {n for n, m in loaded.items() if hasattr(m, "__path__")}
+    if purge & is_pkg:
+        return False           # a package's own code changed: re-import everything
+    # packages with code of their own are re-executed like modules; only the lazy
+    # dialect package is scrubbed (its attributes are a cache it rebuilds on demand)
+    scrub_only = {"sqlglot.dialects"}
     grew = True
     while grew:
         grew = False
         for n in loaded:
-            if n in purge:
+            if n in purge or n in scrub_only:
                 continue
-            if n == "tests" or n.startswith("tests.") or (n not in is_pkg and refs[n] & purge):
+            if n == "tests" or n.startswith("tests.") or refs[n] & purge:
+                if n == "sqlglot":
+                    return False
                 purge.add(n)
                 grew = True
         if len(purge) > 0.6 * len(loaded):

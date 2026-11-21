@@ -181,6 +181,7 @@ class Map:
         self.opens = meta["opens"]
         self.cls = meta["cls"]
         self.cls_bits = meta.get("cls_bits", {})
+        self.import_used = set(meta.get("import_used", ()))
         self._cache = {}
 
     def file(self, path):
@@ -557,7 +558,9 @@ def _one(fp, path, root, mp, r):
                 if e:
                     bits |= e[0]
             key = "%s:%s" % (_modname(path), c.co_qualname)
-            if c.co_name != "<module>" and key in mp.cls_bits:
+            # a class instantiated while modules import can break those imports:
+            # every test that loads the module is in reach
+            if c.co_name != "<module>" and key in mp.cls_bits and key not in mp.import_used:
                 r.add(bits & mp.cls_bits[key], "class %s" % key)
                 r.classes.add(key)
                 continue

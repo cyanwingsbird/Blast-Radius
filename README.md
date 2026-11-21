@@ -16,12 +16,18 @@ Picks the sqlglot tests a patch can break, and splits them across workers.
      statements.
    - A changed class body is narrowed to the tests that used that class or a
      related class (subclasses, nested classes, a dialect's
-     tokenizer/parser/generator).
+     tokenizer/parser/generator). The exception is a class that is
+     instantiated while modules import (recorded with its ancestors). For
+     those, every test that loads the module is in reach.
 2. **Verification** (`runner.py`). Candidate tests are run in the container
    against the patched code. The pinned sqlglot and its tests are imported
    once, and each commit gets a forked child. The child swaps in the changed
    function bodies, or re-imports from the patched sources when module or
-   class bodies changed. Process pools in the tests run in-process. Tests that
+   class bodies changed. A re-import drops only the changed modules and the
+   modules that hold references into them. The parent maps those references
+   once: through classes, their bases and attributes, containers, defaults and
+   shared module-level data. Everything else, such as unaffected dialects,
+   stays loaded. Process pools in the tests run in-process. Tests that
    pass are dropped. Tests that fail, time out or are never reached are kept.
    - **Fixture-driven tests** (`casemap.bin`), such as `check_file`, identity
      and annotate fixtures, run only the fixture items whose recorded coverage
