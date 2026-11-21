@@ -151,6 +151,13 @@ def main():
                 for n, tid in p["order"]:
                     name = tid if isinstance(tid, str) else "FILTER:" + tid[1]
                     dbg.write("%s\t%d\t%s\t%.4f\n" % (cid, n, name, run_cost.get(n, 0.0) if not isinstance(tid, tuple) else -1))
+    if os.environ.get("BR_DEBUG"):
+        with open(os.environ["BR_DEBUG"] + ".res", "a") as dbg:
+            for cid, p in jobs:
+                res = results.get(cid, {})
+                for n, tid in p["order"]:
+                    kind = tid[0] if isinstance(tid, tuple) else ("PROBE" if tid.startswith("PROBE:") else "FULL")
+                    dbg.write("%s\t%d\t%s\t%s\n" % (cid, n, kind, res.get(n, "-")))
     for cid, p in jobs:
         res = results.get(cid, {})
         keep = set(p["blind"])

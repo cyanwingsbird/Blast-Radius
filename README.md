@@ -52,6 +52,12 @@ Safety nets:
 - A wall-clock budget: whatever is unverified when it runs out stays
   scheduled.
 - A per-patch fallback: a patch that cannot be analysed schedules every test.
+- Unusual patches are handled narrowly rather than by scheduling everything:
+  - a permission-only change reaches nothing;
+  - a binary data file keeps only the tests that open it;
+  - a new source file is served to verification (tests that list its
+    package's directory are kept);
+  - CRLF patches are normalised.
 - A global failsafe: if the selector itself fails, every test is printed on
   every commit.
 

@@ -48,6 +48,8 @@ def _path(s):
 
 
 def parse_patch(text):
+    if "\r\n" in text:
+        text = text.replace("\r\n", "\n")
     files = []
     cur = None
     lines = text.split("\n")
@@ -82,8 +84,10 @@ def parse_patch(text):
             cur.old = None
         elif line.startswith("deleted file mode"):
             cur.new = None
-        elif line.startswith(("rename from", "rename to", "copy from", "copy to", "old mode", "new mode")):
+        elif line.startswith(("rename from", "rename to", "copy from", "copy to")):
             cur.rename = True
+        elif line.startswith(("old mode", "new mode")):
+            pass          # a permission change alone does not change what runs
         elif line.startswith(("Binary files", "GIT binary patch")):
             cur.binary = True
         m = _HUNK.match(line)
@@ -441,6 +445,11 @@ _CONFIG = ("conftest.py", "pytest.ini", "tox.ini")
 
 
 def _one(fp, path, root, mp, r):
+    if fp.binary and not fp.rename and path and not path.endswith(".py") and not path.startswith("sqlglot/"):
+        # a binary data file: only the tests that open it can see the change
+        r.add(mp.opens.get(path, 0), "binary " + path)
+        r.blind_bits |= mp.opens.get(path, 0)
+        return
     if fp.binary or fp.rename or (fp.old and fp.new and fp.old != fp.new):
         r.all("binary/rename " + str(path))
         r.runnable = False
