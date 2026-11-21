@@ -1121,18 +1121,44 @@ def _build_exec_cache():
 
 
 class _LazyConn:
-    """A duckdb connection made on first use."""
+    """A duckdb connection made on first use, whose CSV-backed views are created
+    only for the tables a query names (any other use creates them all)."""
 
-    def __init__(self, make):
-        object.__setattr__(self, "_br_make", make)
+    def __init__(self, directory, schema):
+        object.__setattr__(self, "_br_dir", directory)
+        object.__setattr__(self, "_br_schema", schema)
         object.__setattr__(self, "_br_conn", None)
+        object.__setattr__(self, "_br_made", set())
 
-    def _br_get(self):
+    def _br_get(self, sql=None):
+        import duckdb
+        import re
         c = object.__getattribute__(self, "_br_conn")
         if c is None:
-            c = object.__getattribute__(self, "_br_make")()
+            c = duckdb.connect()
             object.__setattr__(self, "_br_conn", c)
+        made = object.__getattribute__(self, "_br_made")
+        schema = object.__getattribute__(self, "_br_schema")
+        directory = object.__getattribute__(self, "_br_dir")
+        for table, columns in schema.items():
+            if table in made:
+                continue
+            if sql is not None and not re.search(r"(?<![A-Za-z0-9_])%s(?![A-Za-z0-9_])" % re.escape(table),
+                                                 sql, re.IGNORECASE):
+                continue
+            file_name = f"{directory}{table}.csv.gz"
+            c.execute(
+                f"""
+                CREATE VIEW {table} AS
+                SELECT *
+                FROM READ_CSV('{file_name}', delim='|', header=True, columns={columns})
+                """
+            )
+            made.add(table)
         return c
+
+    def execute(self, query, *a, **k):
+        return self._br_get(query if isinstance(query, str) else None).execute(query, *a, **k)
 
     def __getattr__(self, name):
         if name == "close" and object.__getattribute__(self, "_br_conn") is None:
@@ -1154,23 +1180,10 @@ def _use_exec_cache(cache):
     import tests.test_executor as te
     from tests.helpers import TPCH_SCHEMA, TPCDS_SCHEMA
 
-    def connect(directory, schema):
-        conn = duckdb.connect()
-        for table, columns in schema.items():
-            file_name = f"{directory}{table}.csv.gz"
-            conn.execute(
-                f"""
-                CREATE VIEW {table} AS
-                SELECT *
-                FROM READ_CSV('{file_name}', delim='|', header=True, columns={columns})
-                """
-            )
-        return conn
-
     def setUpClass(cls):
-        # the duckdb side is set up only if a test asks for it
-        cls.tpch_conn = _LazyConn(lambda: connect(te.DIR_TPCH, TPCH_SCHEMA))
-        cls.tpcds_conn = _LazyConn(lambda: connect(te.DIR_TPCDS, TPCDS_SCHEMA))
+        # the duckdb side is set up only as far as the tests ask for it
+        cls.tpch_conn = _LazyConn(te.DIR_TPCH, TPCH_SCHEMA)
+        cls.tpcds_conn = _LazyConn(te.DIR_TPCDS, TPCDS_SCHEMA)
         cls.tpch_tables = cache["tpch_tables"]
         cls.tpcds_tables = cache["tpcds_tables"]
         cls.cache = {}
