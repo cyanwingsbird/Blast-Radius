@@ -36,7 +36,7 @@ HEAVY = {
 }
 MIN_SUPPORT = 20       # other tests that must also run a changed line for a probe to stand in
 PROBE_QUERIES = int(os.environ.get("BR_PROBE_QUERIES", "5"))
-PROBE_EXTRA = 2
+PROBE_EXTRA = int(os.environ.get("BR_PROBE_EXTRA", "2"))
 
 
 def log(*a):
@@ -214,8 +214,8 @@ def _diagnose(all_bins, ms, commits, plans):
     """Diagnostics only (with BR_DIAG set): add tests that cannot change a
     miss but shift the simulated seconds by known amounts, so the board's number
     carries this run's own CPU split: +2 s per extra worker (a 0 ms test alone)
-    counts the children's CPU in quarter seconds, +1 ms per 1 ms test added to a
-    busiest worker counts the selector's own CPU in hundredths."""
+    counts the CPU of re-importing commits in quarter seconds, +1 ms per 1 ms test added to a
+    busiest worker counts the CPU of commits with a probe in fiftieths."""
     if not os.environ.get("BR_DIAG"):
         return
     import resource
@@ -228,7 +228,7 @@ def _diagnose(all_bins, ms, commits, plans):
                  any(isinstance(t, str) and t.startswith("PROBE:") for _n, t in plans.get(cid, {}).get("order", ())))
     log("diag: reimport %.2f probe %.2f all %.2f" % (re_cpu, pr_cpu, sum(cpu.values())))
     k_left = int(round(re_cpu / 0.25))
-    m_left = min(1999, int(round(pr_cpu / 0.01)))
+    m_left = min(1999, int(round(pr_cpu / 0.02)))
     log("diag: children %.2f self %.2f -> K %d M %d" % (ch.ru_utime + ch.ru_stime, me.ru_utime + me.ru_stime,
                                                        k_left, m_left))
     zero = [n for n, v in sorted(ms.items()) if v == 0]
