@@ -92,7 +92,7 @@ def main():
             heavy[t["number"]] = HEAVY[t["id"]]
     ctx = {"mp": mp, "probes": probes, "heavy": heavy, "map_index": {i: n for n, i in enumerate(mp.ids)},
            "casemap": None, "casemap_path": os.path.join(HERE, "casemap.bin"),
-           "callmap": None, "callmap_path": os.path.join(HERE, "callmap.bin")}
+           "callmap": None, "callmap_path": os.path.join(HERE, "callmap.bin"), "num_by_id": num_by_id}
     map_nums = [num_by_id.get(i) for i in mp.ids]
     unmapped = [t["number"] for t in tests if t["id"] not in set(mp.ids)]
     by_num = {t["number"]: t for t in tests}
@@ -410,7 +410,15 @@ def plan(cid, cand, r, ms, run_cost, setup_cost, by_num, reimport, ctx):
     can = []
     blind = []
     probes = []
+    blind_nums = set()
+    if r.blind_bits:
+        for i, mid in enumerate(ctx["mp"].ids):
+            if r.blind_bits >> i & 1 and mid in ctx["num_by_id"]:
+                blind_nums.add(ctx["num_by_id"][mid])
     for n in cand:
+        if n in blind_nums:
+            blind.append(n)
+            continue
         if verifiable and n in ctx["heavy"]:
             pb = heavy_probe(ctx["heavy"][n], n, r, ctx)
             if pb is not None:

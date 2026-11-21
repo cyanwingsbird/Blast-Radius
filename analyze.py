@@ -329,6 +329,8 @@ class Reach:
         self.lines = {}    # path -> set of old line numbers of changed statements
         self.classes = set()   # "module:qualname" of class bodies that changed
         self.coarse = False    # a change only the whole-module view covers
+        self.new_files = []
+        self.blind_bits = 0    # tests that must be scheduled without verification
 
     def add(self, bits, note):
         self.bits |= bits
@@ -451,9 +453,23 @@ def _one(fp, path, root, mp, r):
             new_text, _ = apply_hunks("", fp.hunks)
         except Exception:
             new_text = None
-        if base in _CONFIG or (is_py and path.startswith(("sqlglot/", "tests/"))):
+        if base in _CONFIG or new_text is None or os.path.exists(os.path.join(root, path)):
             r.all("new file " + path)
             r.runnable = False
+            return
+        if is_py and path.startswith(("sqlglot/", "tests/")):
+            # nothing imports a new module unless other changed code does, and that code
+            # brings its own tests; the module is served to the verification run
+            r.py.append((path, new_text, None))
+            r.new_files.append(path)
+            d = os.path.dirname(path) + "/"
+            scanned = 0
+            for p2, bits in mp.opens.items():
+                if d.startswith("sqlglot/") and p2.startswith(d) and p2.endswith(".py") and "/" not in p2[len(d):]:
+                    scanned |= bits      # tests that read this package's sources list its directory
+            if scanned:
+                r.add(scanned, "lists " + d)
+                r.blind_bits |= scanned
         else:
             r.notes.append("new inert file " + path)
         return
