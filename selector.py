@@ -238,7 +238,10 @@ def heavy_probe(kind, num, r, ctx):
     # are where a real behaviour change is most likely to show up
     big = sorted((i for i in pool if pr["execute"][i] and i not in idx), key=lambda i: -pr["times"][i])[:PROBE_EXTRA]
     extra_est = sum(pr["times"][i] for i in big)
-    return "PROBE:tpcds:" + ",".join(map(str, idx)) + "|" + ",".join(map(str, big)), est, extra_est
+    pid = "PROBE:tpcds:" + ",".join(map(str, idx)) + "|" + ",".join(map(str, big))
+    if not forced:
+        pid += "|quiet"     # may be skipped when the other verified tests all pass
+    return pid, est, extra_est
 
 
 def case_filter(tid, num, r, ctx):

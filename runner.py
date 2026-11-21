@@ -223,6 +223,7 @@ def _filter_fixtures(test_id, allowed):
 
 
 VALIDATE = ("validate_identity", "validate_all", "validate_transpile")
+QUIET_MIN = 3
 
 
 class _Lazy:
@@ -336,6 +337,7 @@ def _probe_case(tid, any_failed=False):
         te = importlib.import_module("tests.test_executor")
         klass = te.TestExecutor
         basic, _, extra = arg.partition("|")
+        extra = extra.split("|")[0]
         idx = [int(x) for x in basic.split(",") if x]
         if any_failed:
             idx += [int(x) for x in extra.split(",") if x]
@@ -407,6 +409,10 @@ def run_tests(order, out_fd, mass_stop=True):
     n_bad = 0
     for num, tid in order:
         is_probe = isinstance(tid, str) and tid.startswith("PROBE:")
+        if is_probe and tid.endswith("|quiet") and not any_failed and n_done >= QUIET_MIN:
+            # at least QUIET_MIN other tests ran against the patch and none failed: skip the probe
+            w.write("%d P 0\n" % num)
+            continue
         if mass_stop and n_bad >= 3 and 2 * n_bad >= n_done and not is_probe:
             w.write("%d S 0\n" % num)
             continue      # a mass breakage: leave the rest scheduled, but still run the probes
