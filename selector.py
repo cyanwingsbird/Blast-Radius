@@ -379,24 +379,21 @@ def call_filter(tid, num, r, ctx):
                 return None        # most calls (or the test outside its calls) run this line
             mask |= m
     if r.classes:
-        # the call map drops classes used by most calls, so a family member's absence
-        # cannot be told from "used everywhere": class-level changes run the whole test
-        return None
-    if r.classes:
+        common = cm.get("common_types")
+        if common is None:
+            return None            # no record of which classes most calls use
+        common = set(common)
         if ctx["casemap"] is None:
             with open(ctx["casemap_path"], "rb") as f:
                 ctx["casemap"] = pickle.loads(zlib.decompress(f.read()))
         fam = ctx["casemap"]["family"]
         for key in r.classes:
-            members = fam.get(key, [key])
             if not (mp.cls_bits.get(key, 0) & tbit):
                 continue
-            hit = 0
-            for member in members:
-                hit |= cm["types"].get(member, 0)
-            if not hit:
-                return None        # used, but by most calls or outside them
-            mask |= hit
+            for member in fam.get(key, [key]):
+                if member in common:
+                    return None    # used by most calls, or outside them: run the whole test
+                mask |= cm["types"].get(member, 0)
     allowed = set()
     est = cm["base"] + 0.002
     i = 0

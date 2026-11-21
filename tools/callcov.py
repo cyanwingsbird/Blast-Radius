@@ -108,8 +108,12 @@ def compact(d):
     half = n / 2.0
     lm = {f: {l: m for l, m in ls.items() if bin(m).count('1') < half} for f, ls in lm.items()}
     lm = {f: ls for f, ls in lm.items() if ls}
+    common = sorted(t for t, m in tm.items() if bin(m).count('1') >= half)
     tm = {t: m for t, m in tm.items() if bin(m).count('1') < half}
-    return lm, tm
+    # classes used outside the calls count as common too: the whole test may depend on them
+    base = d['types'].get(BASE, set())
+    common = sorted(set(common) | set(base))
+    return lm, tm, common
 
 out = {}
 tests = [t for t in T if t['file'].startswith('tests/dialects/')]
@@ -120,8 +124,9 @@ for t in tests:
     b = forked(t['id'], True)
     if b is None or 'error' in b or not b['ok'] or b['n'] != a['n']:
         print('SKIP', t['id'], (b or {}).get('error', '')[-200:] if b else '', file=sys.stderr); continue
-    lm, tm = compact(b)
+    lm, tm, common = compact(b)
     costs = [round(a['cost'].get(('call', i), 0.0), 5) for i in range(a['n'])]
-    out[t['id']] = {'n': a['n'], 'cost': costs, 'base': round(a['cost'].get(BASE, 0.0), 4), 'lines': lm, 'types': tm}
+    out[t['id']] = {'n': a['n'], 'cost': costs, 'base': round(a['cost'].get(BASE, 0.0), 4), 'lines': lm, 'types': tm,
+                    'common_types': common}
 pickle.dump(out, open(OUT, 'wb'))
 print('done', len(out), file=sys.stderr)
