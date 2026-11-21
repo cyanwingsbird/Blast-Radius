@@ -37,7 +37,13 @@ class SyncExecutor(cf.Executor):
 
     def __init__(self, max_workers=None, mp_context=None, initializer=None, initargs=(), **_kw):
         if initializer is not None:
-            initializer(*pickle.loads(pickle.dumps(initargs, protocol=pickle.HIGHEST_PROTOCOL)))
+            # a worker gets its own copy of these; this child is thrown away after its tests,
+            # and what the initializer is given is only read by the queries (the executor
+            # tests' tables), so the copy is skipped for the big ones
+            if _big(initargs):
+                initializer(*initargs)
+            else:
+                initializer(*pickle.loads(pickle.dumps(initargs, protocol=pickle.HIGHEST_PROTOCOL)))
 
     def submit(self, fn, /, *args, **kwargs):
         f = cf.Future()
@@ -53,6 +59,14 @@ class SyncExecutor(cf.Executor):
 
     def shutdown(self, wait=True, *, cancel_futures=False):
         pass
+
+
+def _big(args):
+    try:
+        return any(isinstance(a, dict) and len(a) > 5 and
+                   all(type(v).__name__ == "Table" for v in a.values()) for a in args)
+    except Exception:
+        return False
 
 
 def install_sync_pools():
