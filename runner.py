@@ -1,0 +1,651 @@
+"""Run a few sqlglot tests against a patched tree, inside a forked child.
+
+The parent imports the pinned sqlglot and the test modules once.  Each commit
+gets a forked child that patches the already-imported code in place (swapping
+function code objects) or, when module- or class-level code changed, drops
+every sqlglot/tests module and re-imports them from the patched sources.
+Process pools in the tests are replaced by an in-process executor so the
+patched code is what runs, and no interpreters have to be spawned.
+"""
+
+import builtins
+import concurrent.futures as cf
+import gc
+import importlib.abc
+import importlib.machinery
+import importlib.util
+import io
+import json
+import os
+import pickle
+import signal
+import sys
+import time
+import types
+import unittest
+
+ROOT = os.environ.get("SQLGLOT_ROOT", "/opt/sqlglot")
+CodeType = types.CodeType
+FunctionType = types.FunctionType
+
+
+# ------------------------------------------------------------ sync pool
+
+class SyncExecutor(cf.Executor):
+    """Runs submitted calls immediately, with arguments and results passed
+    through pickle as a process pool would."""
+
+    def __init__(self, max_workers=None, mp_context=None, initializer=None, initargs=(), **_kw):
+        if initializer is not None:
+            initializer(*pickle.loads(pickle.dumps(initargs, protocol=pickle.HIGHEST_PROTOCOL)))
+
+    def submit(self, fn, /, *args, **kwargs):
+        f = cf.Future()
+        try:
+            a, k = pickle.loads(pickle.dumps((args, kwargs), protocol=pickle.HIGHEST_PROTOCOL))
+            res = fn(*a, **k)
+            res = pickle.loads(pickle.dumps(res, protocol=pickle.HIGHEST_PROTOCOL))
+        except BaseException as e:  # noqa: BLE001
+            f.set_exception(e)
+        else:
+            f.set_result(res)
+        return f
+
+    def shutdown(self, wait=True, *, cancel_futures=False):
+        pass
+
+
+def install_sync_pools():
+    cf.ProcessPoolExecutor = SyncExecutor
+    import concurrent.futures.process as cfp
+    cfp.ProcessPoolExecutor = SyncExecutor
+    for name, mod in list(sys.modules.items()):
+        if mod is not None and name.startswith("tests") and getattr(mod, "ProcessPoolExecutor", None) is not None:
+            mod.ProcessPoolExecutor = SyncExecutor
+
+
+# ------------------------------------------------------------ overlays
+
+class PatchedFinder(importlib.abc.MetaPathFinder):
+    def __init__(self, sources):
+        self.sources = sources  # module name -> (path, text)
+
+    def find_spec(self, name, path=None, target=None):
+        got = self.sources.get(name)
+        if got is None:
+            return None
+        fpath, text = got
+        is_pkg = fpath.endswith("__init__.py")
+        loader = PatchedLoader(fpath, text)
+        spec = importlib.util.spec_from_file_location(
+            name, fpath, loader=loader,
+            submodule_search_locations=[os.path.dirname(fpath)] if is_pkg else None)
+        return spec
+
+
+class PatchedLoader(importlib.abc.Loader):
+    def __init__(self, path, text):
+        self.path = path
+        self.text = text
+
+    def create_module(self, spec):
+        return None
+
+    def exec_module(self, module):
+        code = compile(self.text, self.path, "exec", dont_inherit=True)
+        exec(code, module.__dict__)
+
+
+def modname(rel):
+    m = rel[:-3].replace("/", ".")
+    if m.endswith(".__init__"):
+        m = m[: -len(".__init__")]
+    return m
+
+
+def install_data_overlay(data):
+    """data: {abs path: text}"""
+    if not data:
+        return
+    real_open = io.open
+
+    def patched_open(file, mode="r", *a, **k):
+        try:
+            p = os.path.abspath(os.fspath(file)) if isinstance(file, (str, bytes, os.PathLike)) else None
+        except Exception:
+            p = None
+        if isinstance(p, bytes):
+            p = p.decode()
+        if p is not None and p in data and not any(c in mode for c in "wax+"):
+            text = data[p]
+            if "b" in mode:
+                return io.BytesIO(text.encode("utf-8"))
+            return io.StringIO(text)
+        return real_open(file, mode, *a, **k)
+
+    builtins.open = patched_open
+    io.open = patched_open
+
+
+# ------------------------------------------------------------ code swaps
+
+def _subtree_differs(a, b, sig):
+    if sig(a) != sig(b):
+        return True
+    ka = [x for x in a.co_consts if isinstance(x, CodeType)]
+    kb = [x for x in b.co_consts if isinstance(x, CodeType)]
+    if len(ka) != len(kb):
+        return True
+    return any(_subtree_differs(x, y, sig) for x, y in zip(ka, kb))
+
+
+def plan_swaps(old, new, sig):
+    """Pairs (old_code, new_code) for function code objects to replace, or
+    None when a module- or class-body changed (needs a re-import)."""
+    pairs = []
+
+    def walk(a, b):
+        ka = [x for x in a.co_consts if isinstance(x, CodeType)]
+        kb = [x for x in b.co_consts if isinstance(x, CodeType)]
+        if len(ka) != len(kb):
+            return False
+        if not (a.co_flags & 1):           # module / class body
+            if sig(a) != sig(b):
+                return False
+        for x, y in zip(ka, kb):
+            if (x.co_flags & 1) and _subtree_differs(x, y, sig):
+                if (x.co_name != y.co_name or len(x.co_freevars) != len(y.co_freevars)):
+                    return False
+                pairs.append((x, y))
+                # nested code is reached through the new parent's constants,
+                # but closures already made from nested code need swapping too
+                if not walk_nested(x, y):
+                    return False
+            elif not (x.co_flags & 1):
+                if not walk(x, y):
+                    return False
+        return True
+
+    def walk_nested(a, b):
+        ka = [x for x in a.co_consts if isinstance(x, CodeType)]
+        kb = [x for x in b.co_consts if isinstance(x, CodeType)]
+        if len(ka) != len(kb):
+            return False
+        for x, y in zip(ka, kb):
+            if _subtree_differs(x, y, sig):
+                if len(x.co_freevars) != len(y.co_freevars):
+                    return False
+                pairs.append((x, y))
+                if not walk_nested(x, y):
+                    return False
+        return True
+
+    if not walk(old, new):
+        return None
+    return pairs
+
+
+# ------------------------------------------------------------ the runner
+
+def load_case(test_id):
+    f, cls, meth = test_id.split("::")
+    mod = importlib.import_module(f[:-3].replace("/", "."))
+    return getattr(mod, cls), meth
+
+
+LOADERS = ("load_sql_fixture_pairs", "load_sql_fixtures")
+
+
+def _filter_fixtures(test_id, allowed):
+    """Make the test's fixture loaders yield only the allowed (file, index) items."""
+    mod = importlib.import_module(test_id.split("::")[0][:-3].replace("/", "."))
+    saved = {}
+    for name in LOADERS:
+        orig = getattr(mod, name, None)
+        if orig is None:
+            continue
+        saved[name] = orig
+
+        def make(orig):
+            def gen(filename, *a, **k):
+                for idx, item in enumerate(orig(filename, *a, **k)):
+                    if (filename, idx) in allowed:
+                        yield item
+            return gen
+
+        setattr(mod, name, make(orig))
+
+    def restore():
+        for name, orig in saved.items():
+            setattr(mod, name, orig)
+
+    return restore
+
+
+def _probe_case(tid):
+    """Cheap stand-ins for the two slowest tests.
+
+    PROBE:tpcds:<i,j,...>  runs test_execute_tpcds on only those queries.
+    PROBE:max_nodes        runs test_max_nodes' checks on a smaller query."""
+    kind, _, arg = tid[len("PROBE:"):].partition(":")
+    if kind == "tpcds":
+        te = importlib.import_module("tests.test_executor")
+        klass = te.TestExecutor
+        idx = [int(x) for x in arg.split(",") if x]
+
+        def _br_probe(self):
+            sub = [type(self).tpcds_sqls[i] for i in idx]
+            self.tpcds_sqls = sub
+            self._mp_execute(te.TPCDS_SCHEMA, self.tpcds_tables, sub, False)
+
+        klass._br_probe = _br_probe
+        return klass, "_br_probe"
+    if kind == "max_nodes":
+        tp = importlib.import_module("tests.test_parser")
+        klass = tp.TestParser
+        klass._br_probe = _max_nodes_probe
+        return klass, "_br_probe"
+    raise ValueError(tid)
+
+
+def _max_nodes_probe(self):
+    from sqlglot import exp, parse_one
+    from sqlglot.errors import ParseError
+
+    self.assertIsInstance(parse_one("SELECT 1", max_nodes=1_000_000), exp.Select)
+    cols = [f"col{i}" for i in range(500)]
+    self.assertIsInstance(parse_one(f"SELECT {','.join(cols)} FROM t", max_nodes=1_000_000), exp.Select)
+    width = 100
+    depth = 100
+    expr = "x" + "=x" * depth
+    sql = f"SELECT {','.join(expr for _ in range(width))}"
+    self.assertIsInstance(parse_one(sql, max_nodes=10_000_000), exp.Select)
+    with self.assertRaises(ParseError) as ctx:
+        parse_one(sql, max_nodes=10_000)
+    self.assertIn("Maximum number of AST nodes", str(ctx.exception))
+    with self.assertRaises(ParseError) as ctx:
+        parse_one(sql, max_nodes=500)
+    self.assertIn("(500)", str(ctx.exception))
+    with self.assertRaises(ParseError):
+        parse_one("SELECT " + ",".join(f"x={i}" for i in range(100)), max_nodes=5)
+    self.assertIsInstance(parse_one("SELECT 1, 2, 3"), exp.Select)
+
+
+class _Result(unittest.TestResult):
+    def __init__(self):
+        super().__init__()
+        self.bad = False
+
+    def addFailure(self, test, err):
+        self.bad = True
+
+    def addError(self, test, err):
+        self.bad = True
+
+    def addSubTest(self, test, subtest, err):
+        if err is not None:
+            self.bad = True
+
+    def addUnexpectedSuccess(self, test):
+        self.bad = True
+
+
+def run_tests(order, out_fd):
+    """order: list of (num, test_id).  Writes 'num status secs' lines to out_fd.
+    Classes are set up once each and torn down at the end of their run."""
+    w = os.fdopen(out_fd, "w", buffering=1)
+    ready = []
+    for num, tid in order:
+        t0 = time.process_time()
+        restore = None
+        try:
+            if isinstance(tid, tuple):            # ("FILTER", test id, allowed items)
+                klass, meth = load_case(tid[1])
+                restore = _filter_fixtures(tid[1], tid[2])
+            elif tid.startswith("PROBE:"):
+                klass, meth = _probe_case(tid)
+            else:
+                klass, meth = load_case(tid)
+        except BaseException:
+            w.write("%d F %.4f\n" % (num, time.process_time() - t0))
+            continue
+        if klass not in ready:
+            ready.append(klass)
+            klass._br_setup_failed = False
+            try:
+                klass.setUpClass()
+            except BaseException:
+                klass._br_setup_failed = True
+        if getattr(klass, "_br_setup_failed", False):
+            w.write("%d F %.4f\n" % (num, time.process_time() - t0))
+            continue
+        res = _Result()
+        try:
+            case = klass(meth)
+            case.run(res)
+            bad = res.bad
+        except BaseException:
+            bad = True
+        if restore is not None:
+            restore()
+        w.write("%d %s %.4f\n" % (num, "F" if bad else "P", time.process_time() - t0))
+    for klass in ready:
+        _teardown(klass)
+    w.write("DONE\n")
+    w.flush()
+
+
+def _teardown(klass):
+    try:
+        klass.tearDownClass()
+    except BaseException:
+        pass
+    try:
+        klass.doClassCleanups()
+    except BaseException:
+        pass
+
+
+def _ckey(c):
+    return (os.path.realpath(c.co_filename), c.co_qualname, c.co_firstlineno)
+
+
+def _limit_duckdb_threads():
+    """One duckdb thread: the host may have many cores and every thread's CPU is billed."""
+    try:
+        import duckdb
+    except Exception:
+        return
+    real = duckdb.connect
+    if getattr(real, "_br_wrapped", False):
+        return
+
+    def connect(*a, **k):
+        cfg = dict(k.pop("config", None) or {})
+        cfg.setdefault("threads", 1)
+        return real(*a, config=cfg, **k)
+
+    connect._br_wrapped = True
+    duckdb.connect = connect
+
+
+class Warm:
+    """State prepared once in the parent."""
+
+    def __init__(self, test_files):
+        os.environ.setdefault("SKIP_INTEGRATION", "0")
+        if ROOT not in sys.path:
+            sys.path.insert(0, ROOT)
+        os.chdir(ROOT)
+        # third-party modules the tests use
+        for m in ("duckdb", "numpy", "pandas", "pandas.testing", "csv", "gzip", "decimal", "datetime"):
+            try:
+                importlib.import_module(m)
+            except Exception:
+                pass
+        _limit_duckdb_threads()
+        import sqlglot  # noqa: F401
+        for f in sorted(test_files):
+            try:
+                importlib.import_module(f[:-3].replace("/", "."))
+            except Exception:
+                pass
+        # load every dialect so lazily imported modules exist here, once
+        try:
+            from sqlglot.dialects.dialect import Dialects, Dialect
+            for d in Dialects:
+                if d.value:
+                    try:
+                        Dialect.get_or_raise(d.value)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        install_sync_pools()
+        self.exec_cache = None
+        if "tests/test_executor.py" in test_files:
+            try:
+                self.exec_cache = _build_exec_cache()
+            except Exception:
+                self.exec_cache = None
+        self.funcs = {}
+        for o in gc.get_objects():
+            if type(o) is FunctionType:
+                c = o.__code__
+                if c.co_filename.startswith(ROOT):
+                    self.funcs.setdefault(_ckey(c), []).append(o)
+        gc.freeze()
+
+    def apply(self, py, data, sig, load_old):
+        """In the child: make the patched sources live.  py: [(rel, text, new_code)]."""
+        reimport = False
+        swaps = []
+        for rel, text, new_code in py:
+            name = modname(rel)
+            if new_code is None or name not in sys.modules:
+                reimport = True
+                continue
+            old_code = load_old(rel)
+            pairs = plan_swaps(old_code, new_code, sig)
+            if pairs is None:
+                reimport = True
+                continue
+            swaps.extend(pairs)
+        if reimport:
+            sources = {modname(rel): (os.path.join(ROOT, rel), text) for rel, text, _c in py}
+            for name in list(sys.modules):
+                if name == "sqlglot" or name.startswith(("sqlglot.", "tests.")) or name == "tests":
+                    del sys.modules[name]
+            sys.meta_path.insert(0, PatchedFinder(sources))
+            importlib.invalidate_caches()
+        else:
+            for old, new in swaps:
+                for fn in self.funcs.get(_ckey(old), ()):
+                    if fn.__code__.co_code == old.co_code:
+                        fn.__code__ = new
+        install_data_overlay({os.path.join(ROOT, rel): text for rel, text in data})
+        if not reimport and self.exec_cache is not None and not data:
+            touched = {_ckey(old) for old, _new in swaps}
+            if not (touched & self.exec_cache["codes"]):
+                _use_exec_cache(self.exec_cache)
+        return reimport
+
+
+def child_main(warm, job, out_fd):
+    """job: dict with py, data, order."""
+    if os.environ.get("BR_GC"):
+        a, b, c = (int(x) for x in os.environ["BR_GC"].split(","))
+        gc.set_threshold(a, b, c)
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    os.dup2(devnull, 1)
+    os.dup2(devnull, 2)
+    sys.stdout = io.StringIO()
+    sys.stderr = io.StringIO()
+    try:
+        import analyze
+        reimport = warm.apply(job["py"], job["data"], analyze._sig,
+                              lambda rel: analyze.load_old_code(ROOT, rel, open(os.path.join(ROOT, rel)).read()))
+        if reimport:
+            install_sync_pools()
+            # re-imported test modules need the sync pool too
+            for _num, tid in job["order"]:
+                try:
+                    load_case(tid)
+                except BaseException:
+                    pass
+            install_sync_pools()
+        run_tests(job["order"], out_fd)
+    except BaseException:
+        pass
+    os._exit(0)
+
+
+class Running:
+    def __init__(self, cid, pid, rfd, order, deadline_for):
+        self.cid = cid
+        self.pid = pid
+        self.rfile = os.fdopen(rfd, "r")
+        self.order = order
+        self.results = {}
+        self.done = False
+        self.deadline_for = deadline_for
+        self.started = time.monotonic()
+        self.buf = ""
+
+
+def run_jobs(warm, jobs, parallel=2, log=None, deadline=None):
+    """jobs: list of (cid, job dict incl. 'order' and 'budget' seconds per test).
+    Returns {cid: {num: 'P'|'F'|'T'}} - tests missing from a result were not run."""
+    import select
+    pending = list(jobs)
+    active = []
+    out = {}
+    while pending or active:
+        if deadline is not None and time.time() > deadline:
+            # out of time: whatever is unverified stays scheduled
+            for a in active:
+                a.done = True
+            pending = []
+        while pending and len(active) < parallel:
+            cid, job = pending.pop(0)
+            r, w = os.pipe()
+            pid = os.fork()
+            if pid == 0:
+                os.close(r)
+                child_main(warm, job, w)
+                os._exit(0)
+            os.close(w)
+            os.set_blocking(r, False)
+            st = Running(cid, pid, r, job["order"], job["limits"])
+            st.next_idx = 0
+            st.stop_on_fail = job.get("stop_on_fail", True)
+            st.t_last = time.monotonic()
+            active.append(st)
+        rlist = [a.rfile for a in active]
+        ready, _, _ = select.select(rlist, [], [], 0.05)
+        now = time.monotonic()
+        for a in list(active):
+            if a.rfile in ready:
+                try:
+                    chunk = os.read(a.rfile.fileno(), 65536).decode()
+                except BlockingIOError:
+                    chunk = None
+                if chunk == "":
+                    a.done = True
+                elif chunk:
+                    a.buf += chunk
+                    while "\n" in a.buf:
+                        line, a.buf = a.buf.split("\n", 1)
+                        if line == "DONE":
+                            a.done = True
+                            continue
+                        num, st, _secs = line.split()
+                        a.results[int(num)] = st
+                        a.next_idx += 1
+                        a.t_last = now
+                        if st == "T":
+                            a.done = True
+                        elif st != "P" and a.stop_on_fail:
+                            nf = sum(1 for v in a.results.values() if v != "P")
+                            if nf >= 3 and 2 * nf >= len(a.results):
+                                a.done = True     # a mass breakage: keep the rest blind
+            if not a.done:
+                # time limit for the test in progress
+                if a.next_idx < len(a.order):
+                    num = a.order[a.next_idx][0]
+                    lim = a.deadline_for.get(num, 5.0)
+                    if now - a.t_last > lim:
+                        a.results[num] = "T"
+                        a.done = True
+            if a.done:
+                try:
+                    os.kill(a.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                cpu = -1.0
+                try:
+                    _p, _st, ru = os.wait4(a.pid, 0)
+                    cpu = ru.ru_utime + ru.ru_stime
+                except ChildProcessError:
+                    pass
+                a.rfile.close()
+                out[a.cid] = a.results
+                active.remove(a)
+                if log:
+                    log("ran %s: %d/%d in %.2fs cpu %.2f" % (a.cid, len(a.results), len(a.order), now - a.started, cpu))
+    return out
+
+
+# ------------------------------------------------- executor test fixtures
+
+class _NoConn:
+    def execute(self, *a, **k):
+        return self
+
+    def close(self):
+        pass
+
+
+def _build_exec_cache():
+    """Run TestExecutor.setUpClass once here, without duckdb, and remember
+    the tables it builds and every function it ran."""
+    import duckdb
+    import tests.test_executor as te
+    mon = sys.monitoring
+    tool = 2
+    codes = set()
+
+    def on_start(code, _off):
+        if code.co_filename.startswith(ROOT):
+            codes.add(_ckey(code))
+        return mon.DISABLE
+
+    mon.use_tool_id(tool, "br-setup")
+    mon.register_callback(tool, mon.events.PY_START, on_start)
+    mon.set_events(tool, mon.events.PY_START)
+    real = duckdb.connect
+    duckdb.connect = lambda *a, **k: _NoConn()
+    try:
+        te.TestExecutor.setUpClass()
+    finally:
+        duckdb.connect = real
+        mon.set_events(tool, 0)
+        mon.register_callback(tool, mon.events.PY_START, None)
+        mon.free_tool_id(tool)
+    k = te.TestExecutor
+    cache = {name: getattr(k, name) for name in ("tpch_tables", "tpcds_tables", "tpch_sqls", "tpcds_sqls")}
+    for name in ("tpch_conn", "tpcds_conn", "cache") + tuple(cache):
+        try:
+            delattr(k, name)
+        except AttributeError:
+            pass
+    cache["codes"] = codes
+    return cache
+
+
+def _use_exec_cache(cache):
+    import duckdb
+    import tests.test_executor as te
+    from tests.helpers import TPCH_SCHEMA, TPCDS_SCHEMA
+
+    def setUpClass(cls):
+        cls.tpch_conn = duckdb.connect()
+        cls.tpcds_conn = duckdb.connect()
+        for conn, directory, schema in ((cls.tpch_conn, te.DIR_TPCH, TPCH_SCHEMA),
+                                        (cls.tpcds_conn, te.DIR_TPCDS, TPCDS_SCHEMA)):
+            for table, columns in schema.items():
+                file_name = f"{directory}{table}.csv.gz"
+                conn.execute(
+                    f"""
+                CREATE VIEW {table} AS
+                SELECT *
+                FROM READ_CSV('{file_name}', delim='|', header=True, columns={columns})
+                """
+                )
+        cls.tpch_tables = cache["tpch_tables"]
+        cls.tpcds_tables = cache["tpcds_tables"]
+        cls.cache = {}
+        cls.tpch_sqls = cache["tpch_sqls"]
+        cls.tpcds_sqls = cache["tpcds_sqls"]
+
+    te.TestExecutor.setUpClass = classmethod(setUpClass)
