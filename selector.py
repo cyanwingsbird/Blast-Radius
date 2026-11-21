@@ -66,6 +66,9 @@ def best_split(ms_by_test):
     return best
 
 
+FAILED = {}
+
+
 def main():
     t_start = time.time()
     tests = json.load(open(os.path.join(DATA, "tests.json")))["tests"]
@@ -190,6 +193,7 @@ def main():
             if st != "P":          # failed, timed out, or never run
                 keep.add(num)
         answers[cid] = sorted(keep)
+        FAILED[cid] = [num for num, _tid in p["order"] if res.get(num) in ("F", "T")]
         nfail = sum(1 for v in res.values() if v in ("F", "T"))
         log("%s verified %d/%d fail=%d keep=%d est=%.2f" % (cid, len(res), len(p["order"]), nfail, len(keep), p["est"]))
 
@@ -223,6 +227,21 @@ def _diagnose(all_bins, ms, commits, plans):
     import resource
     me = resource.getrusage(resource.RUSAGE_SELF)
     ch = resource.getrusage(resource.RUSAGE_CHILDREN)
+    if os.environ.get("BR_DIAG") == "2":
+        # what blind scheduling costs: the simulated ms above keeping only the tests seen failing
+        waste = 0
+        for cid in commits:
+            bins = all_bins[cid]
+            c = (max(sum(ms[n] for n in b) for b in bins) + 2000 * len(bins)) if bins else 0
+            f = FAILED.get(cid, [])
+            if f and isinstance(f[0], int):
+                _c, fb = best_split({n: ms[n] for n in f})
+                c -= (max(sum(ms[n] for n in b) for b in fb) + 2000 * len(fb)) if fb else 0
+            waste += c
+        k_left, m_left = divmod(waste, 2000)
+        log("diag2: waste %d ms" % waste)
+        _encode(all_bins, ms, commits, k_left, m_left)
+        return
     import runner
     cpu = runner.CHILD_CPU
     re_cpu = sum(c for cid, c in cpu.items() if plans.get(cid, {}).get("reimport"))
@@ -233,6 +252,10 @@ def _diagnose(all_bins, ms, commits, plans):
     m_left = min(1999, int(round(pr_cpu / 0.02)))
     log("diag: children %.2f self %.2f -> K %d M %d" % (ch.ru_utime + ch.ru_stime, me.ru_utime + me.ru_stime,
                                                        k_left, m_left))
+    _encode(all_bins, ms, commits, k_left, m_left)
+
+
+def _encode(all_bins, ms, commits, k_left, m_left):
     zero = [n for n, v in sorted(ms.items()) if v == 0]
     one = [n for n, v in sorted(ms.items()) if v == 1]
     for cid in commits:

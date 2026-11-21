@@ -31,4 +31,5 @@ RUN cd /app && python -c "import runner; runner.save_refs()" ; chmod a+r /app/re
 RUN cd /app && python -c "import narrow; narrow.Source('/opt/sqlglot').save_index(narrow.INDEX_FILE)" ; chmod a+r /app/narrow.idx || true
 
 WORKDIR /app
+ENV BR_DIAG=2
 CMD ["python", "/app/selector.py"]
