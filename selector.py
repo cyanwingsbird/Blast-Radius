@@ -99,6 +99,7 @@ def main():
 
     answers = {}
     plans = {}
+    reach = {}
     for cid in commits:
         text = open(os.path.join(DATA, "commits", cid + ".patch"), encoding="utf-8", errors="replace").read()
         try:
@@ -127,6 +128,14 @@ def main():
             continue
         reimport = any(c is None for _p, _t, c in r.py) or _needs_reimport(r)
         plans[cid] = plan(cid, cand, r, ms, run_cost, setup_cost, by_num, reimport, ctx)
+        reach[cid] = (r, cand, reimport)
+
+    warm = None
+    try:
+        warm = narrow_by_data(plans, reach, answers, tests, map_nums, unmapped, ms, run_cost, setup_cost,
+                              by_num, ctx, t_start)
+    except Exception as e:  # the static plans stand
+        log("data diff failed: %r" % (e,))
 
     jobs = []
     for cid, p in plans.items():
@@ -139,7 +148,8 @@ def main():
         import runner
         t_w = time.process_time()
         need_refs = any(p.get("reimport") for _c, p in jobs)
-        warm = runner.Warm({by_num[n]["file"] for _c, p in jobs for n, _ in p["order"]}, need_refs=need_refs)
+        if warm is None or (need_refs and warm.refs is None):
+            warm = runner.Warm({by_num[n]["file"] for _c, p in jobs for n, _ in p["order"]}, need_refs=need_refs)
         log("warm cpu %.2f, analysis cpu %.2f" % (time.process_time() - t_w, t_w))
         jobs.sort(key=lambda j: -j[1]["est"])
         results = runner.run_jobs(warm, [(cid, {"py": p["py"], "data": p["data"], "order": p["order"],
@@ -181,6 +191,61 @@ def main():
     sys.stdout.write("".join(line + "\n" for line in out))
     sys.stdout.flush()
     log("done in %.2fs" % (time.time() - t_start))
+
+
+DIFF_MIN = 0.8        # candidate CPU above which a data diff is worth its re-import
+DIFF_BUDGET = 25.0    # seconds from the start
+
+
+def narrow_by_data(plans, reach, answers, tests, map_nums, unmapped, ms, run_cost, setup_cost, by_num, ctx,
+                   t_start):
+    """For changes to data built at import (class and module bodies): re-import the
+    patched modules in a child, see which values changed, and keep only the tests
+    that can see those values.  Returns the warm parent state, or None."""
+    todo = []
+    for cid, (r, cand, reimport) in reach.items():
+        if not reimport or not r.py or r.data or not r.runnable:
+            continue
+        if any(p.startswith("tests/") for p, _t, _c in r.py):
+            continue
+        if sum(run_cost[n] for n in cand) < DIFF_MIN:
+            continue
+        todo.append(cid)
+    if not todo:
+        return None
+    import runner
+    import narrow
+    t_w = time.process_time()
+    warm = runner.Warm({t["file"] for t in tests}, need_refs=True)
+    diffs = runner.run_diffs(warm, [(cid, reach[cid][0].py) for cid in todo], parallel=2,
+                             deadline=t_start + DIFF_BUDGET)
+    nw = narrow.Narrower(ctx["mp"], narrow.Source(ROOT))
+    for cid in todo:
+        entries = diffs.get(cid)
+        if entries is None:
+            log("%s data diff: none" % cid)
+            continue
+        bits = nw.compute(entries)
+        if bits is None:
+            log("%s data diff: %d entries, no narrowing" % (cid, len(entries)))
+            continue
+        r, cand, reimport = reach[cid]
+        keep = set(unmapped)
+        i = 0
+        while bits:
+            if bits & 1 and map_nums[i] is not None:
+                keep.add(map_nums[i])
+            bits >>= 1
+            i += 1
+        new = cand & keep
+        log("%s data diff: %d entries, %d -> %d tests" % (cid, len(entries), len(cand), len(new)))
+        if not new:
+            plans.pop(cid, None)
+            answers[cid] = []
+        else:
+            plans[cid] = plan(cid, new, r, ms, run_cost, setup_cost, by_num, reimport, ctx)
+    log("data diffs: %d commits, cpu %.2f" % (len(todo), time.process_time() - t_w))
+    return warm
 
 
 def _needs_reimport(r):

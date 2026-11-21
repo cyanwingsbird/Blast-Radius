@@ -714,6 +714,18 @@ class Warm:
                 self.exec_cache = None
         self.refs = None
         if need_refs:
+            # every sqlglot module, so that a data diff never meets one it has no pinned copy of
+            for dirpath, _dirs, files in os.walk(os.path.join(ROOT, "sqlglot")):
+                for f in sorted(files):
+                    if not f.endswith(".py") or f == "__main__.py":
+                        continue
+                    rel = os.path.relpath(os.path.join(dirpath, f), ROOT)
+                    name = modname(rel)
+                    if name not in sys.modules:
+                        try:
+                            importlib.import_module(name)
+                        except Exception:
+                            pass
             try:
                 loaded = {n: m for n, m in list(sys.modules.items()) if m is not None and _ours(n)}
                 registry = importlib.import_module("sqlglot.dialects.dialect")._Dialect
@@ -791,6 +803,93 @@ def child_main(warm, job, out_fd):
     except BaseException:
         pass
     os._exit(0)
+
+
+def diff_main(warm, py, out_fd):
+    """Child: re-import with the patch and report how module and class data changed."""
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    os.dup2(devnull, 1)
+    os.dup2(devnull, 2)
+    sys.stdout = io.StringIO()
+    sys.stderr = io.StringIO()
+    res = None
+    try:
+        import analyze
+        import datadiff
+        old = {n: m for n, m in list(sys.modules.items()) if m is not None and _ours(n)}
+        changed = {modname(rel) for rel, _t, _c in py}
+        if all(n in old for n in changed):
+            reimport = warm.apply(py, [], analyze._sig,
+                                  lambda rel: analyze.load_old_code(ROOT, rel, open(os.path.join(ROOT, rel)).read()))
+            if reimport:
+                purged = [n for n in old if n not in sys.modules and n != "tests" and not n.startswith("tests.")]
+                pairs = {}
+                for n in purged:
+                    pairs[n] = (old[n], importlib.import_module(n))
+                if all(n in pairs for n in changed):
+                    res = datadiff.describe(datadiff.diff_modules(pairs, set(pairs)), ROOT)
+    except BaseException:
+        res = None
+    try:
+        data = pickle.dumps(res)
+    except BaseException:
+        data = pickle.dumps(None)
+    view = memoryview(data)
+    while view:
+        try:
+            n = os.write(out_fd, view)
+        except BlockingIOError:
+            time.sleep(0.001)
+            continue
+        view = view[n:]
+    os._exit(0)
+
+
+def run_diffs(warm, items, parallel=2, deadline=None):
+    """items: [(cid, py)].  Returns {cid: entries or None}."""
+    import select
+    pending = list(items)
+    active = {}
+    out = {}
+    while pending or active:
+        if deadline is not None and time.time() > deadline:
+            for fd, (cid, pid, _buf) in list(active.items()):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except OSError:
+                    pass
+                os.waitpid(pid, 0)
+                os.close(fd)
+                out[cid] = None
+            active = {}
+            for cid, _py in pending:
+                out[cid] = None
+            break
+        while pending and len(active) < parallel:
+            cid, py = pending.pop(0)
+            r, w = os.pipe()
+            pid = os.fork()
+            if pid == 0:
+                os.close(r)
+                diff_main(warm, py, w)
+                os._exit(0)
+            os.close(w)
+            active[r] = (cid, pid, [])
+        ready, _, _ = select.select(list(active), [], [], 0.05)
+        for fd in ready:
+            cid, pid, buf = active[fd]
+            chunk = os.read(fd, 1 << 20)
+            if chunk:
+                buf.append(chunk)
+                continue
+            os.close(fd)
+            os.waitpid(pid, 0)
+            del active[fd]
+            try:
+                out[cid] = pickle.loads(b"".join(buf))
+            except Exception:
+                out[cid] = None
+    return out
 
 
 class Running:
