@@ -143,7 +143,10 @@ def main():
         log("warm cpu %.2f, analysis cpu %.2f" % (time.process_time() - t_w, t_w))
         jobs.sort(key=lambda j: -j[1]["est"])
         results = runner.run_jobs(warm, [(cid, {"py": p["py"], "data": p["data"], "order": p["order"],
-                                                "limits": p["limits"], "stop_on_fail": True})
+                                                "limits": p["limits"], "stop_on_fail": True,
+                                                "dyn": {"ms": {n: ms[n] for n, _t in p["order"]},
+                                                        "rc": {n: p["rc"].get(n, 0.0) for n, _t in p["order"]},
+                                                        "kept": [ms[n] for n in p["blind"]]}})
                                          for cid, p in jobs], parallel=2, log=log,
                                   deadline=t_start + TIME_BUDGET)
     if os.environ.get("BR_DEBUG"):
@@ -549,6 +552,7 @@ def plan(cid, cand, r, ms, run_cost, setup_cost, by_num, reimport, ctx):
         "limits": limits,
         "est": spent,
         "reimport": reimport,
+        "rc": {n: run_cost[n] for n in verify},
     }
 
 

@@ -406,7 +406,15 @@ class _Result(unittest.TestResult):
         self.bad = True
 
 
-def run_tests(order, out_fd, mass_stop=True):
+def _blind_cost(loads_ms, n, total):
+    """Approximate cost (ms) of scheduling a set unverified: best worker count, LPT bound."""
+    if n == 0:
+        return 0
+    mx = max(loads_ms)
+    return min(max(mx, -(-total // k)) + 2000 * k for k in range(1, min(8, n) + 1))
+
+
+def run_tests(order, out_fd, mass_stop=True, dyn=None):
     """order: list of (num, test_id).  Writes 'num status secs' lines to out_fd.
     Classes are set up once each and torn down at the end of their run."""
     w = os.fdopen(out_fd, "w", buffering=1)
@@ -414,12 +422,23 @@ def run_tests(order, out_fd, mass_stop=True):
     any_failed = False
     n_done = 0
     n_bad = 0
+    kept = list(dyn["kept"]) if dyn else []      # recorded ms of what is already scheduled
     for num, tid in order:
         is_probe = isinstance(tid, str) and tid.startswith("PROBE:")
         if is_probe and tid.endswith("|quiet") and not any_failed and n_done >= QUIET_MIN:
             # at least QUIET_MIN other tests ran against the patch and none failed: skip the probe
             w.write("%d P 0\n" % num)
             continue
+        if dyn and n_bad and not is_probe and num in dyn["ms"]:
+            # a test already failed, so this commit pays for workers anyway: keep a test
+            # unverified when that adds less than running it would cost
+            t_ms = dyn["ms"][num]
+            before = _blind_cost(kept, len(kept), sum(kept))
+            after = _blind_cost(kept + [t_ms], len(kept) + 1, sum(kept) + t_ms)
+            if (after - before) / 1000.0 < dyn["rc"].get(num, 0.0):
+                kept.append(t_ms)
+                w.write("%d S 0\n" % num)
+                continue
         if mass_stop and n_bad >= 3 and 2 * n_bad >= n_done and not is_probe:
             w.write("%d S 0\n" % num)
             continue      # a mass breakage: leave the rest scheduled, but still run the probes
@@ -440,6 +459,8 @@ def run_tests(order, out_fd, mass_stop=True):
             any_failed = True
             n_done += 1
             n_bad += 1
+            if dyn and num in dyn["ms"]:
+                kept.append(dyn["ms"][num])
             w.write("%d F %.4f\n" % (num, time.process_time() - t0))
             continue
         if klass not in ready:
@@ -453,6 +474,8 @@ def run_tests(order, out_fd, mass_stop=True):
             any_failed = True
             n_done += 1
             n_bad += 1
+            if dyn and num in dyn["ms"]:
+                kept.append(dyn["ms"][num])
             w.write("%d F %.4f\n" % (num, time.process_time() - t0))
             continue
         res = _Result()
@@ -467,6 +490,8 @@ def run_tests(order, out_fd, mass_stop=True):
         any_failed = any_failed or bad
         n_done += 1
         n_bad += bool(bad)
+        if bad and dyn and num in dyn["ms"]:
+            kept.append(dyn["ms"][num])
         w.write("%d %s %.4f\n" % (num, "F" if bad else "P", time.process_time() - t0))
     for klass in ready:
         _teardown(klass)
@@ -762,7 +787,7 @@ def child_main(warm, job, out_fd):
                 except BaseException:
                     pass
             install_sync_pools()
-        run_tests(job["order"], out_fd, mass_stop=job.get("stop_on_fail", True))
+        run_tests(job["order"], out_fd, mass_stop=job.get("stop_on_fail", True), dyn=job.get("dyn"))
     except BaseException:
         pass
     os._exit(0)
