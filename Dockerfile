@@ -26,6 +26,7 @@ COPY selector.py analyze.py runner.py datadiff.py narrow.py costs.json map.bin p
 RUN chmod -R a+rX /app && PYTHONDONTWRITEBYTECODE= python -m compileall -q /app
 # the executor tests' tables, built once from the pinned commit (the run falls back to building them)
 RUN cd /app && python -c "import runner; runner.save_exec_cache()" ; chmod a+r /app/execcache.pickle || true
+RUN cd /app && python -c "import runner; runner.save_refs()" ; chmod a+r /app/refs.pickle || true
 RUN cd /app && python -c "import narrow; narrow.Source('/opt/sqlglot').save_index(narrow.INDEX_FILE)" ; chmod a+r /app/narrow.idx || true
 
 WORKDIR /app

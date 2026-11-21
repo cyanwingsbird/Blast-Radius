@@ -728,8 +728,10 @@ class Warm:
                             pass
             try:
                 loaded = {n: m for n, m in list(sys.modules.items()) if m is not None and _ours(n)}
-                registry = importlib.import_module("sqlglot.dialects.dialect")._Dialect
-                self.refs = _module_refs(loaded, registry)
+                self.refs = _load_refs(set(loaded))
+                if self.refs is None:
+                    registry = importlib.import_module("sqlglot.dialects.dialect")._Dialect
+                    self.refs = _module_refs(loaded, registry)
             except Exception:
                 self.refs = None
         self.funcs = {}
@@ -1013,6 +1015,41 @@ class _NoConn:
 
 
 EXEC_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "execcache.pickle")
+
+
+REFS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "refs.pickle")
+
+
+def _load_refs(loaded):
+    """The module reference map made while the image was built, if it covers
+    every module loaded now (it was made with at least as many loaded)."""
+    try:
+        with open(REFS_FILE, "rb") as f:
+            data = pickle.load(f)
+        if data["root"] != os.path.realpath(ROOT) or not loaded <= set(data["refs"]):
+            return None
+        return data["refs"]
+    except Exception:
+        return None
+
+
+def save_refs(path=REFS_FILE):
+    """Build time: load sqlglot and every test module and map module references."""
+    tests = set()
+    for dirpath, _dirs, files in os.walk(os.path.join(ROOT, "tests")):
+        for f in files:
+            if f.startswith("test_") and f.endswith(".py"):
+                tests.add(os.path.relpath(os.path.join(dirpath, f), ROOT))
+    global REFS_FILE
+    keep, REFS_FILE = REFS_FILE, "/nonexistent"
+    try:
+        warm = Warm(tests, need_refs=True)
+    finally:
+        REFS_FILE = keep
+    if warm.refs is None:
+        return
+    with open(path, "wb") as f:
+        pickle.dump({"root": os.path.realpath(ROOT), "refs": warm.refs}, f, protocol=5)
 
 
 def _load_exec_cache():
