@@ -742,6 +742,7 @@ class Warm:
                     self.refs = _module_refs(loaded, registry)
             except Exception:
                 self.refs = None
+        self.table_mod = sys.modules.get("sqlglot.executor.table")
         self.funcs = {}
         for o in gc.get_objects():
             if type(o) is FunctionType:
@@ -750,7 +751,7 @@ class Warm:
                     self.funcs.setdefault(_ckey(c), []).append(o)
         gc.freeze()
 
-    def apply(self, py, data, sig, load_old):
+    def apply(self, py, data, sig, load_old, use_cache=True):
         """In the child: make the patched sources live.  py: [(rel, text, new_code)]."""
         reimport = False
         swaps = []
@@ -783,6 +784,17 @@ class Warm:
             touched = {_ckey(old) for old, _new in swaps}
             if not (touched & self.exec_cache["codes"]):
                 _use_exec_cache(self.exec_cache)
+        elif reimport and use_cache and self.exec_cache is not None and not data:
+            # the tables are still good when nothing their setup ran changed and their
+            # class was not re-imported
+            changed = {os.path.realpath(os.path.join(ROOT, rel)) for rel, _t, _c in py}
+            setup_files = {c[0] for c in self.exec_cache["codes"]}
+            if not (changed & setup_files) and self.table_mod is not None and \
+                    sys.modules.get("sqlglot.executor.table") is self.table_mod:
+                try:
+                    _use_exec_cache(self.exec_cache)
+                except Exception:
+                    pass
         return reimport
 
 
@@ -831,7 +843,8 @@ def diff_main(warm, py, out_fd):
         before = _global_state()
         if all(n in old for n in changed):
             reimport = warm.apply(py, [], analyze._sig,
-                                  lambda rel: analyze.load_old_code(ROOT, rel, open(os.path.join(ROOT, rel)).read()))
+                                  lambda rel: analyze.load_old_code(ROOT, rel, open(os.path.join(ROOT, rel)).read()),
+                                  use_cache=False)
             if reimport:
                 purged = [n for n in old if n not in sys.modules and n != "tests" and not n.startswith("tests.")]
                 pairs = {}

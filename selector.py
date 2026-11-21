@@ -134,7 +134,9 @@ def main():
             continue
         reimport = any(c is None for _p, _t, c in r.py) or _needs_reimport(r)
         # (an edited fixture changes the queries, so recorded duckdb results do not apply either)
-        plans[cid] = plan(cid, cand, r, ms, run_cost_reimport if reimport or r.data else run_cost, setup_cost,
+        exec_setup = r.data or any(p.startswith(("sqlglot/executor/", "tests/", "sqlglot/helper"))
+                                   for p, _t, _c in r.py)
+        plans[cid] = plan(cid, cand, r, ms, run_cost_reimport if exec_setup else run_cost, setup_cost,
                           by_num, reimport, ctx)
         reach[cid] = (r, cand, reimport)
 
