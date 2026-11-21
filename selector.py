@@ -219,7 +219,15 @@ def narrow_by_data(plans, reach, answers, tests, map_nums, unmapped, ms, run_cos
     warm = runner.Warm({t["file"] for t in tests}, need_refs=True)
     diffs = runner.run_diffs(warm, [(cid, reach[cid][0].py) for cid in todo], parallel=2,
                              deadline=t_start + DIFF_BUDGET)
-    nw = narrow.Narrower(ctx["mp"], narrow.Source(ROOT))
+    keymap = None
+    try:
+        import pickle
+        import zlib
+        with open(os.path.join(HERE, "keymap.bin"), "rb") as f:
+            keymap = pickle.loads(zlib.decompress(f.read()))
+    except Exception:
+        keymap = None
+    nw = narrow.Narrower(ctx["mp"], narrow.Source(ROOT), keymap)
     for cid in todo:
         entries = diffs.get(cid)
         if entries is None:

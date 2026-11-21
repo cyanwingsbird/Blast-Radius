@@ -284,6 +284,16 @@ def diff_modules(pairs, purged):
                 if a is None or b is None or not d.same(a[1], b[1]):
                     out.append((where, attr, (a or b)[0], a[1] if a else _MISSING, b[1] if b else _MISSING))
             return
+        if isinstance(va, (set, frozenset)) and isinstance(vb, (set, frozenset)) and type(va) is type(vb):
+            try:
+                ca = {d.canon(x): x for x in va}
+                cb = {d.canon(x): x for x in vb}
+            except _Opaque:
+                out.append((where, attr, None, va, vb))
+                return
+            for ck in ca.keys() ^ cb.keys():
+                out.append((where, attr, ca.get(ck, cb.get(ck)), _MISSING, _MISSING))
+            return
         if not d.same(va, vb):
             out.append((where, attr, None, va, vb))
 
@@ -368,6 +378,14 @@ def _subclasses(k):
     return out
 
 
+def key_repr(k):
+    """How a key is named in the recorded key map (tools/keyrec.py does the same)."""
+    try:
+        return repr(k)[:100]
+    except Exception:
+        return "?"
+
+
 def describe(raw, root):
     """Plain, picklable entries for narrow.Narrower."""
     import os
@@ -378,9 +396,10 @@ def describe(raw, root):
         if attr in ("__bases__", "__class__"):
             e["opaque"] = True
         if isinstance(key, type):
-            e["key"] = ("class", "%s:%s" % (key.__module__, key.__qualname__), sorted(_subclasses(key)))
+            e["key"] = ("class", "%s:%s" % (key.__module__, key.__qualname__), sorted(_subclasses(key)),
+                        key_repr(key))
         elif key is not None:
-            e["key"] = ("other", repr(key)[:100])
+            e["key"] = ("other", key_repr(key))
         fl = []
         for c in _codes(va) if va is not _MISSING else []:
             f = os.path.realpath(c.co_filename)

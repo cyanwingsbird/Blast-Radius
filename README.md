@@ -49,7 +49,27 @@ Picks the sqlglot tests a patch can break, and splits them across workers.
      query. If a changed line is run by the real test but neither by the
      probe nor by at least 20 other tests, the real test is kept. An edit to
      the TPC-DS fixture probes exactly the queries that changed.
-3. **Cost model** (`selector.py`). Per commit, verify the candidates whose CPU
+3. **Data diff** (`datadiff.py`, `narrow.py`, `keymap.bin`). A change to a
+   module or class body mostly changes data that sqlglot builds as it imports:
+   a flag, a dict entry, a set member. When the candidates are worth it, a
+   forked child re-imports the patched modules and compares every module- and
+   class-level value with the pinned one, so it knows exactly which attributes,
+   and which keys of a dict or members of a set, differ (a function counts as
+   changed only if its code, defaults, closure or attributes differ). A test can
+   only notice such a value
+   - through source that names the attribute, run while the test runs (call-time
+     coverage of the line; for test modules, also while they load);
+   - through code that reads attributes by computed names (`getattr` with a
+     computed name, `vars()`, `__dict__`, `dir()`);
+   - for a dict entry or set member: by looking that key up. `keymap.bin`
+     records, per test, the keys looked up at every keyed read of a constant
+     (`d[k]`, `d.get(k)`, `k in d`, also through a local alias) and every key
+     looked up in a constant passed as an argument (through a recording proxy).
+     Any other read of the constant counts as reading all of it. For keys that
+     are classes, a test must also have used the class.
+   The candidates are cut to the tests that can see a changed value. If
+   anything cannot be compared, the static reach stands.
+4. **Cost model** (`selector.py`). Per commit, verify the candidates whose CPU
    (`costs.json`) is less than what scheduling them blind would cost. After a
    failure, verification carries on unless at least half of what has run
    failed. Everything kept is packed longest-first onto however many workers
@@ -85,6 +105,9 @@ commit:
 | `callmap.bin` | `callcov.py`, `skipall.py` (drops tests that cannot run with calls skipped) |
 | `probes.bin` | `tpcds_cov.py`, `probecal.py`, `probe_check.py`, `buildprobes.py` |
 | `costs.json` | `measure.py` |
+| `keymap.bin` | `keyrec.py` with `brrec.py` (records the keys each test looks up, on an instrumented copy whose lines do not move) |
+| `narrow.idx` (in the image) | built by `narrow.py` during the image build |
 
 `mkmut.py` and `groundtruth.py` make one-line mutants and label them by
-running the tests. They were used only to check the selector for misses.
+running the tests; `ddtest.py` and `ddeval.py` check the data-diff narrowing
+against those labels. They were used only to check the selector for misses.

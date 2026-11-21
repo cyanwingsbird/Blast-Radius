@@ -75,15 +75,8 @@ class Source:
             names.update(alias)
         occ = {}
         for p in self.paths:
-            for node in ast.walk(self.tree(p)):
-                if isinstance(node, ast.Attribute) and node.attr in names:
-                    name, is_attr = node.attr, True
-                elif isinstance(node, ast.Name) and node.id in names:
-                    name, is_attr = node.id, False
-                else:
-                    continue
+            for node, name, kind, alias, is_attr, _k in scan(self.tree(p), names):
                 lines = (node.lineno, node.end_lineno or node.lineno)
-                kind, alias = _classify(node, name)
                 occ.setdefault(name, []).append((p, lines, kind, alias, is_attr))
         data = {"root": os.path.realpath(self.root), "paths": self.paths, "dyn": self.dyn(), "occ": occ}
         with open(path, "wb") as f:
@@ -180,16 +173,9 @@ class Source:
             t = self.text(p)
             if not any(n in t for n in names):
                 continue
-            tree = self.tree(p)
-            for node in ast.walk(tree):
-                if isinstance(node, ast.Attribute) and node.attr in names:
-                    name = node.attr
-                elif not attr_only and isinstance(node, ast.Name) and node.id in names:
-                    name = node.id
-                else:
-                    continue
+            for node, _name, kind, alias, _is_attr, _k in scan(self.tree(p), names, attr_only):
                 lines = set(range(node.lineno, (node.end_lineno or node.lineno) + 1))
-                out.append((p, lines) + _classify(node, name))
+                out.append((p, lines, kind, alias))
         return out
 
 
@@ -217,22 +203,44 @@ def _enclosing_func(node):
     return None
 
 
+def _key_node(node):
+    """For a keyed read of `node`: the key expression, or None."""
+    parent = getattr(node, "_br_parent", None)
+    if isinstance(parent, ast.Subscript) and parent.value is node:
+        sl = parent.slice
+        if isinstance(sl, ast.Slice) or (isinstance(sl, ast.Tuple) and any(isinstance(x, ast.Slice) for x in sl.elts)):
+            return None      # a slice of a sequence, not a key
+        return sl
+    if isinstance(parent, ast.Attribute) and parent.value is node and parent.attr in KEYED_METHODS:
+        gp = getattr(parent, "_br_parent", None)
+        if isinstance(gp, ast.Call) and gp.func is parent and gp.args and \
+                not isinstance(gp.args[0], ast.Starred):
+            return gp.args[0]
+        return None
+    if isinstance(parent, ast.Compare) and all(isinstance(op, (ast.In, ast.NotIn)) for op in parent.ops):
+        for i, c in enumerate(parent.comparators):
+            if c is node:
+                return parent.left if i == 0 else parent.comparators[i - 1]
+    return None
+
+
 def _classify(node, name):
     if isinstance(node.ctx, (ast.Store, ast.Del)):
         return ("store", None)
+    if _key_node(node) is not None:
+        return ("keyed", None)
     parent = getattr(node, "_br_parent", None)
-    if isinstance(parent, ast.Subscript) and parent.value is node:
-        return ("keyed", None)
-    if isinstance(parent, ast.Attribute) and parent.value is node and parent.attr in KEYED_METHODS:
-        gp = getattr(parent, "_br_parent", None)
-        if isinstance(gp, ast.Call) and gp.func is parent:
-            return ("keyed", None)
-    if isinstance(parent, ast.Compare) and node in parent.comparators and \
-            all(isinstance(op, (ast.In, ast.NotIn)) for op in parent.ops):
-        return ("keyed", None)
+    if isinstance(parent, ast.Compare) and len(parent.ops) == 1 and \
+            isinstance(parent.ops[0], (ast.Is, ast.IsNot)) and \
+            any(isinstance(x, ast.Constant) and x.value is None for x in [parent.left] + parent.comparators):
+        return ("store", None)    # `x is None`: reads nothing of the value
     if _enclosing_func(node) in COPY_FUNCS:
         return ("copy", None)
+    func = _enclosing_func_node(node)
+    if func is None:
+        return ("deftime", None)  # module or class body: what it computes, the data diff sees
     # x.ALIAS = <expr naming the dict>  (alone or in an `or`)
+    parent = getattr(node, "_br_parent", None)
     p = parent
     while isinstance(p, ast.BoolOp):
         p = getattr(p, "_br_parent", None)
@@ -241,11 +249,61 @@ def _classify(node, name):
         tname = tgt.attr if isinstance(tgt, ast.Attribute) else getattr(tgt, "id", None)
         if tname in ALIASES.get(name, ()):
             return ("copy", tname)
+        if isinstance(tgt, ast.Name):
+            return ("local", tgt.id)
+    if _is_callarg(node):
+        return ("callarg", None)
     return ("opaque", None)
 
 
+def _is_callarg(node):
+    parent = getattr(node, "_br_parent", None)
+    if isinstance(parent, ast.keyword):
+        parent = getattr(parent, "_br_parent", None)
+        return isinstance(parent, ast.Call)
+    return isinstance(parent, ast.Call) and node in parent.args
+
+
+def _enclosing_func_node(node):
+    n = getattr(node, "_br_parent", None)
+    while n is not None:
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            return n
+        n = getattr(n, "_br_parent", None)
+    return None
+
+
+def scan(tree, names, attr_only=False):
+    """Reads of `names` in a parsed file, with reads through a local variable
+    a function assigns one of them to: (node, name, kind, alias, is_attr, key_node)."""
+    out = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and node.attr in names:
+            name, is_attr = node.attr, True
+        elif not attr_only and isinstance(node, ast.Name) and node.id in names:
+            name, is_attr = node.id, False
+        else:
+            continue
+        kind, alias = _classify(node, name)
+        if kind != "local":
+            out.append((node, name, kind, alias, is_attr, _key_node(node) if kind == "keyed" else None))
+            continue
+        out.append((node, name, "copy", alias, is_attr, None))
+        func = _enclosing_func_node(node)
+        for use in ast.walk(func):
+            if isinstance(use, ast.Name) and use.id == alias and isinstance(use.ctx, ast.Load):
+                k2, _a2 = _classify(use, alias)
+                if k2 == "keyed":
+                    out.append((use, name, "keyed", None, is_attr, _key_node(use)))
+                elif k2 == "callarg":
+                    out.append((use, name, "callarg", None, is_attr, None))
+                elif k2 != "store":
+                    out.append((use, name, "opaque", None, is_attr, None))
+    return out
+
+
 class Narrower:
-    def __init__(self, mp, src, map_index_bits=None):
+    def __init__(self, mp, src, keymap=None):
         self.mp = mp
         self.src = src
         u = 0
@@ -254,6 +312,8 @@ class Narrower:
         n = len(mp.ids)
         self.no_types = ((1 << n) - 1) & ~u      # tests that use no class at all: always kept
         self.memo = {}
+        self.keymap = keymap
+        self.unrecorded = keymap["unrecorded"] if keymap is not None else 0
 
     def call_bits(self, path, lines):
         """Tests that run these lines while they run; for test code, also as the
@@ -312,8 +372,14 @@ class Narrower:
         self.memo[k] = b
         return b
 
+    def recorded(self, attr):
+        return self.keymap is not None and attr in self.keymap["names"]
+
     def opaque_bits(self, attr):
-        k = ("opq", attr)
+        """Tests that read `attr` other than key by key (or, when the key map was
+        recorded for it, other than through a recording site)."""
+        rec = self.recorded(attr)
+        k = ("opq", attr, rec)
         if k in self.memo:
             return self.memo[k]
         names = (attr,) + ALIASES.get(attr, ())
@@ -322,7 +388,8 @@ class Narrower:
         for p, lines, kind, _alias in self.src.occurrences(set(names[:1])) + \
                 self.src.occurrences(set(names[1:]), attr_only=True):
             seen.setdefault(p, set()).update(lines)
-            if kind == "opaque":
+            if kind == "opaque" or (kind == "callarg" and not rec) or \
+                    (kind == "deftime" and p.startswith("tests/")):
                 b |= self.call_bits(p, lines)
         # the name written some other way (a string, getattr(x, "NAME")): no telling how it is read
         for name in names:
@@ -331,6 +398,13 @@ class Narrower:
                 if rest:
                     b |= self.call_bits(p, rest)
         self.memo[k] = b
+        return b
+
+    def key_bits(self, attr, key_repr):
+        b = self.unrecorded
+        for name in (attr,) + ALIASES.get(attr, ()):
+            km = self.keymap["keys"].get(name, {})
+            b |= km.get(key_repr, 0) | km.get("*", 0)
         return b
 
     def compute(self, entries):
@@ -344,24 +418,33 @@ class Narrower:
             if attr.startswith("__") and attr.endswith("__") and not e.get("func_lines"):
                 return None
             key = e.get("key")
-            keyed = key is not None and key[0] == "class"
+            keyed = key is not None and key[0] in ("class", "other")
             if e.get("func_lines") and not keyed:
-                # (a function held under a class key is reached only through that key)
+                # (a function held in a dict or set is reached only through it)
                 for p, lines in e["func_lines"]:
                     if p is None:
                         return None
                     bits |= self.call_bits(p, lines)
-            if keyed:
-                _k, cname, subs = key
+            module_level = ":" not in e["where"]
+            if keyed and self.recorded(attr):
+                bits |= self.key_bits(attr, key[-1] if key[0] == "other" else key[3])
+                if key[0] == "class":
+                    for c in [key[1]] + list(key[2]):
+                        bits |= self.mp.cls_bits.get(c, 0)
+                bits |= self.opaque_bits(attr)
+                bits |= self.dyn_bits(attr, module_level)
+                continue
+            if keyed and key[0] == "class":
+                _k, cname, subs = key[:3]
                 for c in [cname] + list(subs):
                     bits |= self.mp.cls_bits.get(c, 0)
                     bits |= self.token_bits(c.rsplit(":", 1)[1].rsplit(".", 1)[-1])
                 bits |= self.opaque_bits(attr)
-                bits |= self.dyn_bits(attr, ":" not in e["where"])
+                bits |= self.dyn_bits(attr, module_level)
                 continue
             if ("any", attr) in done_attr:
                 continue
             done_attr.add(("any", attr))
             bits |= self.token_bits(attr)
-            bits |= self.dyn_bits(attr, ":" not in e["where"])
+            bits |= self.dyn_bits(attr, module_level)
         return bits
