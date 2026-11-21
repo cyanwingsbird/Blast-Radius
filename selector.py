@@ -426,6 +426,9 @@ def plan(cid, cand, r, ms, run_cost, setup_cost, by_num, reimport, ctx):
     blind = []
     probes = []
     blind_nums = set()
+    # a change to test code (helpers, loaders) can change what the fixtures yield:
+    # no per-item or per-call filtering and no scaled-down probes then
+    test_code = any(p.startswith("tests/") for p, _t, _c in py)
     if r.blind_bits:
         for i, mid in enumerate(ctx["mp"].ids):
             if r.blind_bits >> i & 1 and mid in ctx["num_by_id"]:
@@ -434,7 +437,7 @@ def plan(cid, cand, r, ms, run_cost, setup_cost, by_num, reimport, ctx):
         if n in blind_nums:
             blind.append(n)
             continue
-        if verifiable and n in ctx["heavy"]:
+        if verifiable and n in ctx["heavy"] and not test_code:
             pb = heavy_probe(ctx["heavy"][n], n, r, ctx)
             if pb is not None:
                 probes.append((n, pb[0], pb[1], pb[2]))
@@ -448,7 +451,7 @@ def plan(cid, cand, r, ms, run_cost, setup_cost, by_num, reimport, ctx):
     if alpha != 1.0:
         run_cost = {k: v * alpha for k, v in run_cost.items()}
     spec = {}
-    if verifiable and not r.coarse:
+    if verifiable and not r.coarse and not test_code:
         for n in can:
             got = case_filter(by_num[n]["id"], n, r, ctx)
             if got is not None:
