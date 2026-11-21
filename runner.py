@@ -818,6 +818,7 @@ def diff_main(warm, py, out_fd):
         import datadiff
         old = {n: m for n, m in list(sys.modules.items()) if m is not None and _ours(n)}
         changed = {modname(rel) for rel, _t, _c in py}
+        before = _global_state()
         if all(n in old for n in changed):
             reimport = warm.apply(py, [], analyze._sig,
                                   lambda rel: analyze.load_old_code(ROOT, rel, open(os.path.join(ROOT, rel)).read()))
@@ -826,7 +827,7 @@ def diff_main(warm, py, out_fd):
                 pairs = {}
                 for n in purged:
                     pairs[n] = (old[n], importlib.import_module(n))
-                if all(n in pairs for n in changed):
+                if all(n in pairs for n in changed) and _global_state() == before:
                     res = datadiff.describe(datadiff.diff_modules(pairs, set(pairs)), ROOT)
     except BaseException:
         res = None
@@ -843,6 +844,21 @@ def diff_main(warm, py, out_fd):
             continue
         view = view[n:]
     os._exit(0)
+
+
+def _global_state():
+    """Interpreter state an import could change outside any module's namespace."""
+    import logging
+    import warnings
+    import decimal
+    loggers = {}
+    for name, lg in list(logging.Logger.manager.loggerDict.items()):
+        if isinstance(lg, logging.Logger):
+            loggers[name] = (lg.level, lg.disabled, lg.propagate, len(lg.handlers), len(lg.filters))
+    root = logging.getLogger()
+    return (sys.getrecursionlimit(), dict(os.environ), list(sys.path), repr(warnings.filters),
+            (root.level, len(root.handlers)), loggers, logging.root.manager.disable,
+            repr(decimal.getcontext()), sys.getswitchinterval(), sys.int_info, sys.get_int_max_str_digits())
 
 
 def run_diffs(warm, items, parallel=2, deadline=None):
