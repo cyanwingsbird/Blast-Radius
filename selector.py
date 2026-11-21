@@ -191,6 +191,34 @@ def main():
     sys.stdout.write("".join(line + "\n" for line in out))
     sys.stdout.flush()
     log("done in %.2fs" % (time.time() - t_start))
+    try:
+        _calibrate()
+    except BaseException as e:  # noqa: BLE001  (the output is already written)
+        log("calibration failed: %r" % (e,))
+
+
+def _calibrate():
+    """Diagnostics only: with calibrate.json present, spend a fixed amount of
+    sqlglot work after the output is written, to compare CPU speed with ours."""
+    path = os.path.join(HERE, "calibrate.json")
+    if not os.path.exists(path):
+        return
+    import logging
+    logging.disable(logging.CRITICAL)
+    passes = json.load(open(path))["passes"]
+    if ROOT not in sys.path:
+        sys.path.insert(0, ROOT)
+    import sqlglot
+    with open(os.path.join(ROOT, "tests", "fixtures", "identity.sql"), encoding="utf-8") as f:
+        sqls = [x.strip() for x in f if x.strip() and not x.startswith("--")][:400]
+    t = time.process_time()
+    for _ in range(passes):
+        for q in sqls:
+            try:
+                sqlglot.transpile(q, read="duckdb", write="snowflake")
+            except Exception:
+                pass
+    log("calibration cpu %.2f" % (time.process_time() - t))
 
 
 DIFF_MIN = 0.8        # candidate CPU above which a data diff is worth its re-import
@@ -520,7 +548,7 @@ def plan(cid, cand, r, ms, run_cost, setup_cost, by_num, reimport, ctx):
         else:
             blind.append(n)
     run_cost = dict(run_cost)
-    alpha = float(os.environ.get("BR_ALPHA", "1.0"))
+    alpha = float(os.environ.get("BR_ALPHA", "1.75"))
     if alpha != 1.0:
         run_cost = {k: v * alpha for k, v in run_cost.items()}
     spec = {}
