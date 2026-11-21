@@ -968,6 +968,8 @@ def run_jobs(warm, jobs, parallel=2, log=None, deadline=None):
                             a.done = True
                             continue
                         num, st, _secs = line.split()
+                        if os.environ.get("BR_TIMES"):
+                            sys.stderr.write("T %s %s %s %s\n" % (a.cid, num, st, _secs))
                         a.results[int(num)] = st
                         a.next_idx += 1
                         a.t_last = now
@@ -1081,25 +1083,57 @@ def _build_exec_cache():
     return cache
 
 
+class _LazyConn:
+    """A duckdb connection made on first use."""
+
+    def __init__(self, make):
+        object.__setattr__(self, "_br_make", make)
+        object.__setattr__(self, "_br_conn", None)
+
+    def _br_get(self):
+        c = object.__getattribute__(self, "_br_conn")
+        if c is None:
+            c = object.__getattribute__(self, "_br_make")()
+            object.__setattr__(self, "_br_conn", c)
+        return c
+
+    def __getattr__(self, name):
+        if name == "close" and object.__getattribute__(self, "_br_conn") is None:
+            return lambda: None
+        return getattr(self._br_get(), name)
+
+    def __setattr__(self, name, value):
+        setattr(self._br_get(), name, value)
+
+    def __enter__(self):
+        return self._br_get().__enter__()
+
+    def __exit__(self, *a):
+        return self._br_get().__exit__(*a)
+
+
 def _use_exec_cache(cache):
     import duckdb
     import tests.test_executor as te
     from tests.helpers import TPCH_SCHEMA, TPCDS_SCHEMA
 
-    def setUpClass(cls):
-        cls.tpch_conn = duckdb.connect()
-        cls.tpcds_conn = duckdb.connect()
-        for conn, directory, schema in ((cls.tpch_conn, te.DIR_TPCH, TPCH_SCHEMA),
-                                        (cls.tpcds_conn, te.DIR_TPCDS, TPCDS_SCHEMA)):
-            for table, columns in schema.items():
-                file_name = f"{directory}{table}.csv.gz"
-                conn.execute(
-                    f"""
+    def connect(directory, schema):
+        conn = duckdb.connect()
+        for table, columns in schema.items():
+            file_name = f"{directory}{table}.csv.gz"
+            conn.execute(
+                f"""
                 CREATE VIEW {table} AS
                 SELECT *
                 FROM READ_CSV('{file_name}', delim='|', header=True, columns={columns})
                 """
-                )
+            )
+        return conn
+
+    def setUpClass(cls):
+        # the duckdb side is set up only if a test asks for it
+        cls.tpch_conn = _LazyConn(lambda: connect(te.DIR_TPCH, TPCH_SCHEMA))
+        cls.tpcds_conn = _LazyConn(lambda: connect(te.DIR_TPCDS, TPCDS_SCHEMA))
         cls.tpch_tables = cache["tpch_tables"]
         cls.tpcds_tables = cache["tpcds_tables"]
         cls.cache = {}
