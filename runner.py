@@ -650,8 +650,15 @@ def _partial_purge(changed, refs):
     return True
 
 
+_REALPATH = {}
+
+
 def _ckey(c):
-    return (os.path.realpath(c.co_filename), c.co_qualname, c.co_firstlineno)
+    f = c.co_filename
+    r = _REALPATH.get(f)
+    if r is None:
+        r = _REALPATH[f] = os.path.realpath(f)
+    return (r, c.co_qualname, c.co_firstlineno)
 
 
 def _limit_duckdb_threads():
