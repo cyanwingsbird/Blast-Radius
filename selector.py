@@ -183,11 +183,16 @@ def main():
         nfail = sum(1 for v in res.values() if v in ("F", "T"))
         log("%s verified %d/%d fail=%d keep=%d est=%.2f" % (cid, len(res), len(p["order"]), nfail, len(keep), p["est"]))
 
-    out = []
+    all_bins = {}
     for cid in commits:
         keep = answers.get(cid, [])
         _cost, bins = best_split({n: ms[n] for n in keep})
-        out.append(json.dumps({"commit": cid, "workers": bins}, separators=(",", ":")))
+        all_bins[cid] = bins
+    try:
+        _diagnose(all_bins, ms, commits)
+    except Exception as e:  # noqa: BLE001
+        log("diagnose failed: %r" % (e,))
+    out = [json.dumps({"commit": cid, "workers": all_bins[cid]}, separators=(",", ":")) for cid in commits]
     sys.stdout.write("".join(line + "\n" for line in out))
     sys.stdout.flush()
     log("done in %.2fs" % (time.time() - t_start))
@@ -195,6 +200,45 @@ def main():
         _calibrate()
     except BaseException as e:  # noqa: BLE001  (the output is already written)
         log("calibration failed: %r" % (e,))
+
+
+def _diagnose(all_bins, ms, commits):
+    """Diagnostics only (with BR_DIAG set): add tests that cannot change a
+    miss but shift the simulated seconds by known amounts, so the board's number
+    carries this run's own CPU split: +2 s per extra worker (a 0 ms test alone)
+    counts the children's CPU in quarter seconds, +1 ms per 1 ms test added to a
+    busiest worker counts the selector's own CPU in hundredths."""
+    if not os.environ.get("BR_DIAG"):
+        return
+    import resource
+    me = resource.getrusage(resource.RUSAGE_SELF)
+    ch = resource.getrusage(resource.RUSAGE_CHILDREN)
+    k_left = int(round((ch.ru_utime + ch.ru_stime) / 0.25))
+    m_left = min(1999, int(round((me.ru_utime + me.ru_stime) / 0.01)))
+    log("diag: children %.2f self %.2f -> K %d M %d" % (ch.ru_utime + ch.ru_stime, me.ru_utime + me.ru_stime,
+                                                       k_left, m_left))
+    zero = [n for n, v in sorted(ms.items()) if v == 0]
+    one = [n for n, v in sorted(ms.items()) if v == 1]
+    for cid in commits:
+        bins = all_bins[cid]
+        used = {n for b in bins for n in b}
+        if m_left and bins:
+            busiest = max(bins, key=lambda b: sum(ms[n] for n in b))
+            for n in one:
+                if not m_left:
+                    break
+                if n not in used:
+                    busiest.append(n)
+                    used.add(n)
+                    m_left -= 1
+        for n in zero:
+            if not k_left or len(bins) >= 8:
+                break
+            if n not in used:
+                bins.append([n])
+                used.add(n)
+                k_left -= 1
+    log("diag left: K %d M %d" % (k_left, m_left))
 
 
 def _calibrate():
