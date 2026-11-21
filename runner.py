@@ -478,6 +478,122 @@ def _teardown(klass):
         pass
 
 
+def _ours(name):
+    return name == "sqlglot" or name.startswith("sqlglot.") or name == "tests" or name.startswith("tests.")
+
+
+def _module_refs(loaded, registry):
+    """For every loaded module: the names of the modules its globals point into
+    (through classes, their bases and attributes, containers and defaults)."""
+    names = set(loaded)
+
+    def add(out, mod):
+        if mod in names:
+            out.add(mod)
+
+    def walk(v, out, depth, seen):
+        if id(v) in seen:
+            return
+        seen.add(id(v))
+        if isinstance(v, types.ModuleType):
+            add(out, v.__name__)
+            return
+        if isinstance(v, type):
+            try:
+                for c in v.__mro__:
+                    add(out, getattr(c, "__module__", None))
+            except Exception:
+                pass
+        elif isinstance(v, (types.FunctionType, types.BuiltinFunctionType)):
+            add(out, getattr(v, "__module__", None))
+        else:
+            add(out, getattr(type(v), "__module__", None))
+        if depth >= 2:
+            return
+        if isinstance(v, dict):
+            for k, x in list(v.items()):
+                walk(k, out, depth + 1, seen)
+                walk(x, out, depth + 1, seen)
+        elif isinstance(v, (list, tuple, set, frozenset)):
+            for x in list(v)[:5000]:
+                walk(x, out, depth + 1, seen)
+        elif isinstance(v, type):
+            for k, x in list(vars(v).items()):
+                if v is registry and k == "_classes":
+                    continue
+                walk(x, out, depth + 1, seen)
+        elif isinstance(v, types.FunctionType):
+            for x in (v.__defaults__ or ()):
+                walk(x, out, depth + 1, seen)
+
+    refs = {}
+    for n, m in loaded.items():
+        out = set()
+        seen = set()
+        for k, v in list(vars(m).items()):
+            walk(v, out, 0, seen)
+        out.discard(n)
+        refs[n] = out
+    return refs
+
+
+def _partial_purge(changed, refs):
+    """Drop the changed modules and every module that holds a reference into them,
+    keeping everything else (above all, the dialects the change cannot reach) loaded.
+    Returns False when a full purge is needed instead."""
+    if refs is None:
+        return False
+    loaded = {n: m for n, m in list(sys.modules.items()) if m is not None and _ours(n)}
+    purge = {n for n in changed if n in loaded}
+    if not purge:
+        return True
+    if any(n == "sqlglot" or n.startswith(("sqlglot.expressions", "sqlglot.dialects.dialect")) for n in purge):
+        return False
+    if any(n not in refs for n in loaded):
+        return False           # something was imported after the map was taken
+    try:
+        registry = importlib.import_module("sqlglot.dialects.dialect")._Dialect
+    except Exception:
+        return False
+    is_pkg = {n for n, m in loaded.items() if hasattr(m, "__path__")}
+    grew = True
+    while grew:
+        grew = False
+        for n in loaded:
+            if n in purge:
+                continue
+            if n == "tests" or n.startswith("tests.") or (n not in is_pkg and refs[n] & purge):
+                purge.add(n)
+                grew = True
+        if len(purge) > 0.6 * len(loaded):
+            return False
+
+    def from_purged(v):
+        if isinstance(v, types.ModuleType):
+            return v.__name__ in purge
+        if isinstance(v, (type, types.FunctionType)):
+            return getattr(v, "__module__", None) in purge
+        return getattr(type(v), "__module__", None) in purge
+
+    for n in purge:
+        sys.modules.pop(n, None)
+    for n in is_pkg:
+        if n in purge:
+            continue
+        m = loaded[n]
+        for k, v in list(vars(m).items()):
+            if not k.startswith("__") and from_purged(v):
+                try:
+                    delattr(m, k)
+                except Exception:
+                    pass
+    reg = registry._classes
+    for k, v in list(reg.items()):
+        if from_purged(v):
+            del reg[k]
+    return True
+
+
 def _ckey(c):
     return (os.path.realpath(c.co_filename), c.co_qualname, c.co_firstlineno)
 
@@ -504,7 +620,7 @@ def _limit_duckdb_threads():
 class Warm:
     """State prepared once in the parent."""
 
-    def __init__(self, test_files):
+    def __init__(self, test_files, need_refs=False):
         os.environ.setdefault("SKIP_INTEGRATION", "0")
         if ROOT not in sys.path:
             sys.path.insert(0, ROOT)
@@ -540,6 +656,14 @@ class Warm:
                 self.exec_cache = _build_exec_cache()
             except Exception:
                 self.exec_cache = None
+        self.refs = None
+        if need_refs:
+            try:
+                loaded = {n: m for n, m in list(sys.modules.items()) if m is not None and _ours(n)}
+                registry = importlib.import_module("sqlglot.dialects.dialect")._Dialect
+                self.refs = _module_refs(loaded, registry)
+            except Exception:
+                self.refs = None
         self.funcs = {}
         for o in gc.get_objects():
             if type(o) is FunctionType:
@@ -565,9 +689,10 @@ class Warm:
             swaps.extend(pairs)
         if reimport:
             sources = {modname(rel): (os.path.join(ROOT, rel), text) for rel, text, _c in py}
-            for name in list(sys.modules):
-                if name == "sqlglot" or name.startswith(("sqlglot.", "tests.")) or name == "tests":
-                    del sys.modules[name]
+            if os.environ.get("BR_FULL_PURGE") or not _partial_purge(set(sources), self.refs):
+                for name in list(sys.modules):
+                    if name == "sqlglot" or name.startswith(("sqlglot.", "tests.")) or name == "tests":
+                        del sys.modules[name]
             sys.meta_path.insert(0, PatchedFinder(sources))
             importlib.invalidate_caches()
         else:

@@ -138,7 +138,8 @@ def main():
     if jobs:
         import runner
         t_w = time.process_time()
-        warm = runner.Warm({by_num[n]["file"] for _c, p in jobs for n, _ in p["order"]})
+        need_refs = any(p.get("reimport") for _c, p in jobs)
+        warm = runner.Warm({by_num[n]["file"] for _c, p in jobs for n, _ in p["order"]}, need_refs=need_refs)
         log("warm cpu %.2f, analysis cpu %.2f" % (time.process_time() - t_w, t_w))
         jobs.sort(key=lambda j: -j[1]["est"])
         results = runner.run_jobs(warm, [(cid, {"py": p["py"], "data": p["data"], "order": p["order"],
@@ -547,6 +548,7 @@ def plan(cid, cand, r, ms, run_cost, setup_cost, by_num, reimport, ctx):
         "data": data,
         "limits": limits,
         "est": spent,
+        "reimport": reimport,
     }
 
 
