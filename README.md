@@ -33,7 +33,8 @@ Picks the sqlglot tests a patch can break, and splits them across workers.
      and annotate fixtures, run only the fixture items whose recorded coverage
      or class usage reaches the change. When a fixture file itself is edited,
      it is split the way the test helpers split it, and only the items that
-     differ are run.
+     differ are run. `test_generator_memory` loops over every dialect, so it
+     runs only the dialects whose iteration reaches the change.
    - **Dialect tests** (`callmap.bin`) are mostly long runs of
      `validate_identity` / `validate_all` calls. They run only the calls whose
      recorded coverage or class usage reaches the change. Each other call
@@ -80,7 +81,7 @@ commit:
 | --- | --- |
 | `map.bin` | `covone.py` + `sitecustomize.py` (per-test line coverage), then `buildmap.py` and `packmap.py` |
 | class bits in `map.bin` | `typeuse.py` (classes each test uses), `family.py`, `buildcls.py` |
-| `casemap.bin` | `casecov.py`, `buildcases.py` |
+| `casemap.bin` | `casecov.py`, `buildcases.py`, `gencov.py` |
 | `callmap.bin` | `callcov.py`, `skipall.py` (drops tests that cannot run with calls skipped) |
 | `probes.bin` | `tpcds_cov.py`, `probecal.py`, `probe_check.py`, `buildprobes.py` |
 | `costs.json` | `measure.py` |

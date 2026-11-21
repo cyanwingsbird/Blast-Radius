@@ -200,6 +200,13 @@ def _filter_fixtures(test_id, allowed):
     """Make the test's fixture loaders yield only the allowed (file, index) items."""
     mod = importlib.import_module(test_id.split("::")[0][:-3].replace("/", "."))
     saved = {}
+    dialects = [v for kind, v in allowed if kind == "__dialects__"]
+    if test_id.endswith("::test_generator_memory"):
+        # its items are the dialects it loops over
+        orig_d = getattr(mod, "Dialects")
+        saved["Dialects"] = orig_d
+        keep = set(dialects)
+        setattr(mod, "Dialects", [d for d in orig_d if d.value in keep])
     for name in LOADERS:
         orig = getattr(mod, name, None)
         if orig is None:
