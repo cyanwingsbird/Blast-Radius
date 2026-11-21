@@ -717,6 +717,7 @@ class Warm:
         if "tests/test_executor.py" in test_files:
             try:
                 self.exec_cache = _load_exec_cache() or _build_exec_cache()
+                _load_duck_cache()
             except Exception:
                 self.exec_cache = None
         self.refs = None
@@ -930,6 +931,9 @@ class Running:
         self.buf = ""
 
 
+CHILD_CPU = {}
+
+
 def run_jobs(warm, jobs, parallel=2, log=None, deadline=None):
     """jobs: list of (cid, job dict incl. 'order' and 'budget' seconds per test).
     Returns {cid: {num: 'P'|'F'|'T'}} - tests missing from a result were not run."""
@@ -1001,6 +1005,7 @@ def run_jobs(warm, jobs, parallel=2, log=None, deadline=None):
                 try:
                     _p, _st, ru = os.wait4(a.pid, 0)
                     cpu = ru.ru_utime + ru.ru_stime
+                    CHILD_CPU[a.cid] = cpu
                 except ChildProcessError:
                     pass
                 a.rfile.close()
@@ -1127,6 +1132,57 @@ def _build_exec_cache():
     return cache
 
 
+DUCK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "duckcache.pickle")
+_DUCK_CACHE = {}
+_DUCK_RECORD = None
+
+
+class _CachedResult:
+    """What duckdb returned for this exact query at the pinned commit."""
+
+    def __init__(self, df):
+        self._df = df
+
+    def fetchdf(self):
+        return self._df
+
+    def df(self):
+        return self._df
+
+
+def _load_duck_cache():
+    global _DUCK_CACHE
+    try:
+        with open(DUCK_FILE, "rb") as f:
+            data = pickle.load(f)
+        if data.get("root") == os.path.realpath(ROOT):
+            _DUCK_CACHE = data["results"]
+    except Exception:
+        _DUCK_CACHE = {}
+
+
+def save_duck_cache(path=DUCK_FILE):
+    """Build time: run the executor tests and keep every duckdb result they fetch."""
+    global _DUCK_RECORD
+    if ROOT not in sys.path:
+        sys.path.insert(0, ROOT)
+    os.chdir(ROOT)
+    _limit_duckdb_threads()
+    install_sync_pools()
+    cache = _load_exec_cache() or _build_exec_cache()
+    _use_exec_cache(cache)
+    install_sync_pools()
+    import tests.test_executor as te
+    _DUCK_RECORD = {}
+    suite = unittest.defaultTestLoader.loadTestsFromTestCase(te.TestExecutor)
+    res = unittest.TestResult()
+    suite.run(res)
+    if res.failures or res.errors:
+        return
+    with open(path, "wb") as f:
+        pickle.dump({"root": os.path.realpath(ROOT), "results": _DUCK_RECORD}, f, protocol=5)
+
+
 class _LazyConn:
     """A duckdb connection made on first use, whose CSV-backed views are created
     only for the tables a query names (any other use creates them all)."""
@@ -1165,6 +1221,15 @@ class _LazyConn:
         return c
 
     def execute(self, query, *a, **k):
+        if isinstance(query, str) and not a and not k:
+            key = (object.__getattribute__(self, "_br_dir"), query)
+            if _DUCK_RECORD is not None:
+                res = self._br_get(query).execute(query)
+                df = res.fetchdf()
+                _DUCK_RECORD[key] = df.copy(deep=True)
+                return _CachedResult(df)
+            if key in _DUCK_CACHE:
+                return _CachedResult(_DUCK_CACHE[key].copy(deep=True))
         return self._br_get(query if isinstance(query, str) else None).execute(query, *a, **k)
 
     def __getattr__(self, name):

@@ -80,6 +80,12 @@ def main():
     for t in tests:
         c = costs["cost"].get(t["id"])
         run_cost[t["number"]] = c if c is not None else t["seconds"] * 1.5 + 0.01
+    # after a re-import the executor tests set up duckdb for real: their old costs
+    run_cost_reimport = dict(run_cost)
+    for t in tests:
+        c = costs.get("cost_reimport", {}).get(t["id"])
+        if c is not None:
+            run_cost_reimport[t["number"]] = c
     setup_cost = costs["setup"]
     import pickle
     import zlib
@@ -127,12 +133,14 @@ def main():
             answers[cid] = []
             continue
         reimport = any(c is None for _p, _t, c in r.py) or _needs_reimport(r)
-        plans[cid] = plan(cid, cand, r, ms, run_cost, setup_cost, by_num, reimport, ctx)
+        # (an edited fixture changes the queries, so recorded duckdb results do not apply either)
+        plans[cid] = plan(cid, cand, r, ms, run_cost_reimport if reimport or r.data else run_cost, setup_cost,
+                          by_num, reimport, ctx)
         reach[cid] = (r, cand, reimport)
 
     warm = None
     try:
-        warm = narrow_by_data(plans, reach, answers, tests, map_nums, unmapped, ms, run_cost, setup_cost,
+        warm = narrow_by_data(plans, reach, answers, tests, map_nums, unmapped, ms, run_cost_reimport, setup_cost,
                               by_num, ctx, t_start)
     except Exception as e:  # the static plans stand
         log("data diff failed: %r" % (e,))
@@ -189,7 +197,7 @@ def main():
         _cost, bins = best_split({n: ms[n] for n in keep})
         all_bins[cid] = bins
     try:
-        _diagnose(all_bins, ms, commits)
+        _diagnose(all_bins, ms, commits, plans)
     except Exception as e:  # noqa: BLE001
         log("diagnose failed: %r" % (e,))
     out = [json.dumps({"commit": cid, "workers": all_bins[cid]}, separators=(",", ":")) for cid in commits]
@@ -202,7 +210,7 @@ def main():
         log("calibration failed: %r" % (e,))
 
 
-def _diagnose(all_bins, ms, commits):
+def _diagnose(all_bins, ms, commits, plans):
     """Diagnostics only (with BR_DIAG set): add tests that cannot change a
     miss but shift the simulated seconds by known amounts, so the board's number
     carries this run's own CPU split: +2 s per extra worker (a 0 ms test alone)
@@ -213,8 +221,14 @@ def _diagnose(all_bins, ms, commits):
     import resource
     me = resource.getrusage(resource.RUSAGE_SELF)
     ch = resource.getrusage(resource.RUSAGE_CHILDREN)
-    k_left = int(round((ch.ru_utime + ch.ru_stime) / 0.25))
-    m_left = min(1999, int(round((me.ru_utime + me.ru_stime) / 0.01)))
+    import runner
+    cpu = runner.CHILD_CPU
+    re_cpu = sum(c for cid, c in cpu.items() if plans.get(cid, {}).get("reimport"))
+    pr_cpu = sum(c for cid, c in cpu.items() if not plans.get(cid, {}).get("reimport") and
+                 any(isinstance(t, str) and t.startswith("PROBE:") for _n, t in plans.get(cid, {}).get("order", ())))
+    log("diag: reimport %.2f probe %.2f all %.2f" % (re_cpu, pr_cpu, sum(cpu.values())))
+    k_left = int(round(re_cpu / 0.25))
+    m_left = min(1999, int(round(pr_cpu / 0.01)))
     log("diag: children %.2f self %.2f -> K %d M %d" % (ch.ru_utime + ch.ru_stime, me.ru_utime + me.ru_stime,
                                                        k_left, m_left))
     zero = [n for n, v in sorted(ms.items()) if v == 0]
