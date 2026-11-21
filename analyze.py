@@ -479,6 +479,9 @@ def _one(fp, path, root, mp, r):
     new_text, changes = apply_hunks(old_text, fp.hunks)
     if new_text == old_text:
         return
+    if is_py and opens:
+        # some tests read this source file as text: they must see the patch
+        r.data.append((path, new_text))
     if base in _CONFIG or (base in ("setup.cfg", "pyproject.toml") and "pytest" in new_text):
         if base in _CONFIG or _pytest_section_changed(old_text, new_text):
             r.all("pytest config " + path)

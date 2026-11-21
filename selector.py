@@ -35,7 +35,7 @@ HEAVY = {
     "tests/test_parser.py::TestParser::test_max_nodes": "max_nodes",
 }
 MIN_SUPPORT = 20       # other tests that must also run a changed line for a probe to stand in
-PROBE_QUERIES = 8
+PROBE_QUERIES = int(os.environ.get("BR_PROBE_QUERIES", "5"))
 
 
 def log(*a):
@@ -179,9 +179,24 @@ def heavy_probe(kind, num, r, ctx):
     if mi is None:
         return None
     hbit = 1 << mi
-    for path, _text in r.data:
-        if mp.opens.get(path, 0) & hbit:
-            return None
+    forced = set()
+    for path, text in r.data:
+        if not (mp.opens.get(path, 0) & hbit):
+            continue
+        if kind == "tpcds" and path == TPCH_FIXTURE:
+            continue          # read during class setup only; the probe runs that setup with the patch
+        if kind == "tpcds" and path == TPCDS_FIXTURE:
+            try:
+                with open(os.path.join(ROOT, path), encoding="utf-8") as f:
+                    old_items = _fixture_pairs(f.read())
+            except OSError:
+                return None
+            new_items = _fixture_pairs(text)
+            if len(new_items) != len(old_items):
+                return None
+            forced |= {i for i, item in enumerate(new_items) if item != old_items[i]}
+            continue
+        return None
     qmask = 0
     for path, lines in r.lines.items():
         got = mp.file(path)
@@ -209,7 +224,7 @@ def heavy_probe(kind, num, r, ctx):
     pool = [i for i in allq if (qmask >> i) & 1] if qmask else list(allq)
     cheap = sorted((i for i in pool if not pr["execute"][i]), key=lambda i: pr["times"][i])[:PROBE_QUERIES]
     ex = sorted((i for i in pool if pr["execute"][i]), key=lambda i: pr["times"][i])[:PROBE_QUERIES]
-    idx = sorted(cheap + ex)
+    idx = sorted(set(cheap + ex) | forced)
     est = pr["base"] + sum(pr["times"][i] for i in idx)
     return "PROBE:tpcds:" + ",".join(map(str, idx)), est
 
@@ -229,9 +244,27 @@ def case_filter(tid, num, r, ctx):
     if mi is None:
         return None
     mp = ctx["mp"]
-    for path, _text in r.data:
-        if mp.opens.get(path, 0) >> mi & 1:
+    fixture_files = ctx.setdefault("fixture_files", {})
+    if tid not in fixture_files:
+        fixture_files[tid] = {f for f, _i in cm["items"]}
+    extra = set()
+    for path, text in r.data:
+        if not (mp.opens.get(path, 0) >> mi & 1):
+            continue
+        rel = path[len(FIXTURE_PREFIX):] if path.startswith(FIXTURE_PREFIX) else None
+        if rel is None or rel not in fixture_files[tid]:
             return None
+        try:
+            with open(os.path.join(ROOT, path), encoding="utf-8") as f:
+                old_text = f.read()
+        except OSError:
+            return None
+        for split in (_fixture_pairs, _fixture_lines):
+            old_items = split(old_text)
+            new_items = split(text)
+            for idx, item in enumerate(new_items):
+                if idx >= len(old_items) or old_items[idx] != item:
+                    extra.add((rel, idx))
     mask = 0
     for path, lines in r.lines.items():
         fl = cm["lines"].get(path)
@@ -243,8 +276,8 @@ def case_filter(tid, num, r, ctx):
         for member in fam.get(key, [key]):
             mask |= cm["types"].get(member, 0)
     items = cm["items"]
-    allowed = set()
-    est = cm["base"] + 0.002
+    allowed = set(extra)
+    est = cm["base"] + 0.002 + 0.01 * len(extra)
     i = 0
     m = mask
     while m:
@@ -254,6 +287,35 @@ def case_filter(tid, num, r, ctx):
         m >>= 1
         i += 1
     return allowed, est
+
+
+FIXTURE_PREFIX = "tests/fixtures/"
+TPCH_FIXTURE = "tests/fixtures/optimizer/tpc-h/tpc-h.sql"
+TPCDS_FIXTURE = "tests/fixtures/optimizer/tpc-ds/tpc-ds.sql"
+
+
+def _filter_comments(s):
+    # as tests/helpers.py does
+    return "\n".join([line for line in s.splitlines() if line and not line.startswith("--")])
+
+
+def _fixture_lines(text):
+    """The items load_sql_fixtures yields for this text."""
+    out = []
+    lines = []
+    for line in _filter_comments(text).splitlines():
+        lines.append(line)
+        if not line.startswith("#"):
+            out.append("\n".join(lines))
+            lines = []
+    return out
+
+
+def _fixture_pairs(text):
+    """The items load_sql_fixture_pairs yields for this text (as raw text pairs)."""
+    statements = _filter_comments(text).split(";")
+    return [(statements[i].strip(), statements[i + 1].strip())
+            for i in range(0, len(statements), 2) if i + 1 < len(statements)]
 
 
 def _setup(cls, setup_cost, reimport, data):
