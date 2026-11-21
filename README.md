@@ -41,6 +41,12 @@ Picks the sqlglot tests a patch can break, and splits them across workers.
      returns a lazy stand-in that runs the real call if the test uses its
      result. If a changed line or class is used by most of a test's calls, or
      outside them, the whole test runs.
+   - **Executor tests** reuse what never depends on the patch: the TPC-H/TPC-DS
+     tables (built once while the image builds), duckdb connections and views
+     made only when a query needs them, and duckdb's answer for every query the
+     tests send at the pinned commit (recorded while the image builds and used
+     only when the query text is exactly the same). After a re-import, or when a
+     fixture is edited, the tests set everything up for real.
    - **Source read as text.** When a test reads a source file as text (for
      example, `test_typing`), it is served the patched text.
    - **The two slowest tests** (`probes.bin`) are stood in for by probes.
@@ -107,6 +113,7 @@ commit:
 | `costs.json` | `measure.py` |
 | `keymap.bin` | `keyrec.py` with `brrec.py` (records the keys each test looks up, on an instrumented copy whose lines do not move) |
 | `narrow.idx` (in the image) | built by `narrow.py` during the image build |
+| `execcache.pickle`, `duckcache.pickle`, `refs.pickle` (in the image) | built by `runner.py` during the image build: executor tables, duckdb results of the pinned queries, module reference map |
 
 `mkmut.py` and `groundtruth.py` make one-line mutants and label them by
 running the tests; `ddtest.py` and `ddeval.py` check the data-diff narrowing

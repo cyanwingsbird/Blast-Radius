@@ -332,6 +332,9 @@ def narrow_by_data(plans, reach, answers, tests, map_nums, unmapped, ms, run_cos
             bits >>= 1
             i += 1
         new = cand & keep
+        cbits, classes = nw.by_class
+        if cbits and classes:
+            ctx.setdefault("by_class", {})[cid] = (cbits, classes)
         log("%s data diff: %d entries, %d -> %d tests" % (cid, len(entries), len(cand), len(new)))
         if not new:
             plans.pop(cid, None)
@@ -610,8 +613,29 @@ def plan(cid, cand, r, ms, run_cost, setup_cost, by_num, reimport, ctx):
     if alpha != 1.0:
         run_cost = {k: v * alpha for k, v in run_cost.items()}
     spec = {}
+    by_class = ctx.get("by_class", {}).get(cid)
+    if by_class is not None and verifiable and not test_code:
+        # tests kept only for using a class whose dict entry changed: only the
+        # fixture items or calls that use that class
+        import analyze
+        rc = analyze.Reach()
+        rc.classes = set(by_class[1])
+        for n in can:
+            mi = ctx["map_index"].get(by_num[n]["id"])
+            if mi is None or not (by_class[0] >> mi & 1):
+                continue
+            for kind, filt in (("FILTER", case_filter), ("CALLS", call_filter)):
+                got = filt(by_num[n]["id"], n, rc, ctx)
+                if got is not None:
+                    allowed, est = got
+                    if est < run_cost[n]:
+                        run_cost[n] = est
+                        spec[n] = (kind, by_num[n]["id"], allowed)
+                    break
     if verifiable and not r.coarse and not test_code:
         for n in can:
+            if n in spec:
+                continue
             got = case_filter(by_num[n]["id"], n, r, ctx)
             if got is not None:
                 allowed, est = got

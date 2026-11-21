@@ -433,7 +433,13 @@ class Narrower:
         return b
 
     def compute(self, entries):
-        """entries: dicts from datadiff.describe.  Returns test bits or None."""
+        """entries: dicts from datadiff.describe.  Returns test bits or None.
+        Afterwards self.by_class is (bits, classes): the tests kept only because
+        they use one of `classes` (keys of changed dict entries), which can be
+        narrowed further to the parts of the test that use them."""
+        self.by_class = (0, set())
+        seen_bits = 0
+        seen_classes = set()
         bits = self.no_types
         done_attr = set()
         for e in entries:
@@ -456,14 +462,16 @@ class Narrower:
                 bits |= self.key_bits(attr, key[-1] if key[0] == "other" else key[3], resize)
                 if key[0] == "class":
                     for c in [key[1]] + list(key[2]):
-                        bits |= self.mp.cls_bits.get(c, 0)
+                        seen_bits |= self.mp.cls_bits.get(c, 0)
+                        seen_classes.add(c)
                 bits |= self.opaque_bits(attr, resize)
                 bits |= self.dyn_bits(attr, module_level)
                 continue
             if keyed and key[0] == "class":
                 _k, cname, subs = key[:3]
                 for c in [cname] + list(subs):
-                    bits |= self.mp.cls_bits.get(c, 0)
+                    seen_bits |= self.mp.cls_bits.get(c, 0)
+                    seen_classes.add(c)
                     bits |= self.token_bits(c.rsplit(":", 1)[1].rsplit(".", 1)[-1])
                 bits |= self.opaque_bits(attr)
                 bits |= self.dyn_bits(attr, module_level)
@@ -473,4 +481,5 @@ class Narrower:
             done_attr.add(("any", attr))
             bits |= self.token_bits(attr)
             bits |= self.dyn_bits(attr, module_level)
-        return bits
+        self.by_class = (seen_bits & ~bits, seen_classes)
+        return bits | seen_bits
