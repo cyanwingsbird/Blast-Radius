@@ -379,6 +379,10 @@ def call_filter(tid, num, r, ctx):
                 return None        # most calls (or the test outside its calls) run this line
             mask |= m
     if r.classes:
+        # the call map drops classes used by most calls, so a family member's absence
+        # cannot be told from "used everywhere": class-level changes run the whole test
+        return None
+    if r.classes:
         if ctx["casemap"] is None:
             with open(ctx["casemap_path"], "rb") as f:
                 ctx["casemap"] = pickle.loads(zlib.decompress(f.read()))
@@ -443,6 +447,9 @@ def plan(cid, cand, r, ms, run_cost, setup_cost, by_num, reimport, ctx):
         else:
             blind.append(n)
     run_cost = dict(run_cost)
+    alpha = float(os.environ.get("BR_ALPHA", "1.0"))
+    if alpha != 1.0:
+        run_cost = {k: v * alpha for k, v in run_cost.items()}
     spec = {}
     if verifiable and not r.coarse:
         for n in can:
