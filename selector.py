@@ -36,6 +36,7 @@ HEAVY = {
 }
 MIN_SUPPORT = 20       # other tests that must also run a changed line for a probe to stand in
 PROBE_QUERIES = int(os.environ.get("BR_PROBE_QUERIES", "5"))
+PROBE_EXTRA = 2
 
 
 def log(*a):
@@ -90,7 +91,8 @@ def main():
         if t["id"] in HEAVY:
             heavy[t["number"]] = HEAVY[t["id"]]
     ctx = {"mp": mp, "probes": probes, "heavy": heavy, "map_index": {i: n for n, i in enumerate(mp.ids)},
-           "casemap": None, "casemap_path": os.path.join(HERE, "casemap.bin")}
+           "casemap": None, "casemap_path": os.path.join(HERE, "casemap.bin"),
+           "callmap": None, "callmap_path": os.path.join(HERE, "callmap.bin")}
     map_nums = [num_by_id.get(i) for i in mp.ids]
     unmapped = [t["number"] for t in tests if t["id"] not in set(mp.ids)]
     by_num = {t["number"]: t for t in tests}
@@ -143,6 +145,12 @@ def main():
                                                 "limits": p["limits"], "stop_on_fail": True})
                                          for cid, p in jobs], parallel=2, log=log,
                                   deadline=t_start + TIME_BUDGET)
+    if os.environ.get("BR_DEBUG"):
+        with open(os.environ["BR_DEBUG"], "a") as dbg:
+            for cid, p in jobs:
+                for n, tid in p["order"]:
+                    name = tid if isinstance(tid, str) else "FILTER:" + tid[1]
+                    dbg.write("%s\t%d\t%s\t%.4f\n" % (cid, n, name, run_cost.get(n, 0.0) if not isinstance(tid, tuple) else -1))
     for cid, p in jobs:
         res = results.get(cid, {})
         keep = set(p["blind"])
@@ -151,7 +159,7 @@ def main():
             if st != "P":          # failed, timed out, or never run
                 keep.add(num)
         answers[cid] = sorted(keep)
-        nfail = sum(1 for v in res.values() if v != "P")
+        nfail = sum(1 for v in res.values() if v in ("F", "T"))
         log("%s verified %d/%d fail=%d keep=%d est=%.2f" % (cid, len(res), len(p["order"]), nfail, len(keep), p["est"]))
 
     out = []
@@ -218,7 +226,7 @@ def heavy_probe(kind, num, r, ctx):
                 elif others < MIN_SUPPORT:
                     return None
     if kind == "max_nodes":
-        return "PROBE:max_nodes", 0.35
+        return "PROBE:max_nodes", 0.35, 0.0
     pr = ctx["probes"]["tpcds"]
     allq = range(len(pr["times"]))
     pool = [i for i in allq if (qmask >> i) & 1] if qmask else list(allq)
@@ -226,7 +234,11 @@ def heavy_probe(kind, num, r, ctx):
     ex = sorted((i for i in pool if pr["execute"][i]), key=lambda i: pr["times"][i])[:PROBE_QUERIES]
     idx = sorted(set(cheap + ex) | forced)
     est = pr["base"] + sum(pr["times"][i] for i in idx)
-    return "PROBE:tpcds:" + ",".join(map(str, idx)), est
+    # run as well when the commit already broke another test: the most complex queries
+    # are where a real behaviour change is most likely to show up
+    big = sorted((i for i in pool if pr["execute"][i] and i not in idx), key=lambda i: -pr["times"][i])[:PROBE_EXTRA]
+    extra_est = sum(pr["times"][i] for i in big)
+    return "PROBE:tpcds:" + ",".join(map(str, idx)) + "|" + ",".join(map(str, big)), est, extra_est
 
 
 def case_filter(tid, num, r, ctx):
@@ -318,6 +330,67 @@ def _fixture_pairs(text):
             for i in range(0, len(statements), 2) if i + 1 < len(statements)]
 
 
+def call_filter(tid, num, r, ctx):
+    """For a dialect test built from validate_* calls: the calls that can reach
+    the change, and the CPU to run only those.  None when the whole test has to run."""
+    import pickle
+    import zlib
+    if ctx["callmap"] is None:
+        with open(ctx["callmap_path"], "rb") as f:
+            ctx["callmap"] = pickle.loads(zlib.decompress(f.read()))
+    cm = ctx["callmap"].get(tid)
+    if cm is None:
+        return None
+    mi = ctx["map_index"].get(tid)
+    if mi is None:
+        return None
+    mp = ctx["mp"]
+    tbit = 1 << mi
+    for path, _text in r.data:
+        if mp.opens.get(path, 0) & tbit:
+            return None
+    mask = 0
+    for path, lines in r.lines.items():
+        got = mp.file(path)
+        if got is None:
+            continue
+        cov = got[0]
+        per_call = cm["lines"].get(path, {})
+        for ln in lines:
+            e = cov.get(ln)
+            if not e or not ((e[0] | e[1]) & tbit):
+                continue
+            m = per_call.get(ln)
+            if m is None:
+                return None        # most calls (or the test outside its calls) run this line
+            mask |= m
+    if r.classes:
+        if ctx["casemap"] is None:
+            with open(ctx["casemap_path"], "rb") as f:
+                ctx["casemap"] = pickle.loads(zlib.decompress(f.read()))
+        fam = ctx["casemap"]["family"]
+        for key in r.classes:
+            members = fam.get(key, [key])
+            if not (mp.cls_bits.get(key, 0) & tbit):
+                continue
+            hit = 0
+            for member in members:
+                hit |= cm["types"].get(member, 0)
+            if not hit:
+                return None        # used, but by most calls or outside them
+            mask |= hit
+    allowed = set()
+    est = cm["base"] + 0.002
+    i = 0
+    while mask:
+        if mask & 1:
+            allowed.add(i)
+            est += cm["cost"][i]
+        mask >>= 1
+        i += 1
+    return allowed, est
+
+
 def _setup(cls, setup_cost, reimport, data):
     sc = setup_cost.get(cls, 0.0)
     if cls == EXEC_CLASS and not reimport and not data:
@@ -341,7 +414,7 @@ def plan(cid, cand, r, ms, run_cost, setup_cost, by_num, reimport, ctx):
         if verifiable and n in ctx["heavy"]:
             pb = heavy_probe(ctx["heavy"][n], n, r, ctx)
             if pb is not None:
-                probes.append((n, pb[0], pb[1]))
+                probes.append((n, pb[0], pb[1], pb[2]))
                 continue
         if verifiable and by_num[n]["id"] not in NO_VERIFY:
             can.append(n)
@@ -357,10 +430,17 @@ def plan(cid, cand, r, ms, run_cost, setup_cost, by_num, reimport, ctx):
                 if est < run_cost[n]:
                     run_cost[n] = est
                     spec[n] = ("FILTER", by_num[n]["id"], allowed)
+                continue
+            got = call_filter(by_num[n]["id"], n, r, ctx)
+            if got is not None:
+                allowed, est = got
+                if est < run_cost[n]:
+                    run_cost[n] = est
+                    spec[n] = ("CALLS", by_num[n]["id"], allowed)
     base_ovh = CHILD_OVERHEAD + (REIMPORT_OVERHEAD if reimport else 0.0)
     probe_cost = 0.0
     classes0 = set()
-    for n, _pid, est in probes:
+    for n, _pid, est, _extra in probes:
         probe_cost += est
         cls = by_num[n]["id"].rsplit("::", 1)[0]
         if cls not in classes0:
@@ -426,8 +506,9 @@ def plan(cid, cand, r, ms, run_cost, setup_cost, by_num, reimport, ctx):
                                by_num[n]["id"].rsplit("::", 1)[0], run_cost[n], n))
     limits = {}
     seen = set()
-    order = [(n, pid) for n, pid, _est in probes] + [(n, spec.get(n, by_num[n]["id"])) for n in verify]
-    est_of = {n: est for n, _pid, est in probes}
+    # probes last: whether the tests before them failed decides how far the TPC-DS probe goes
+    order = [(n, spec.get(n, by_num[n]["id"])) for n in verify] + [(n, pid) for n, pid, _est, _x in probes]
+    est_of = {n: est + extra for n, _pid, est, extra in probes}
     for i, (n, _tid) in enumerate(order):
         cls = by_num[n]["id"].rsplit("::", 1)[0]
         if n in est_of:

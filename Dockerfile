@@ -22,7 +22,7 @@ os.rename('/opt/sqlglot-${SQLGLOT_SHA}', '/opt/sqlglot')" \
  && PYTHONDONTWRITEBYTECODE= python -m compileall -q -j 4 /opt/sqlglot/sqlglot /opt/sqlglot/tests \
  && chmod -R a+rX /opt/sqlglot
 
-COPY selector.py analyze.py runner.py costs.json map.bin probes.bin casemap.bin /app/
+COPY selector.py analyze.py runner.py costs.json map.bin probes.bin casemap.bin callmap.bin /app/
 RUN chmod -R a+rX /app && PYTHONDONTWRITEBYTECODE= python -m compileall -q /app
 
 WORKDIR /app

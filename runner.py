@@ -222,7 +222,111 @@ def _filter_fixtures(test_id, allowed):
     return restore
 
 
-def _probe_case(tid):
+VALIDATE = ("validate_identity", "validate_all", "validate_transpile")
+
+
+class _Lazy:
+    """Stands in for the result of a validate_* call that was not run.
+    The call runs the moment anything looks at the result."""
+
+    __slots__ = ("_br_f", "_br_v", "_br_done")
+
+    def __init__(self, f):
+        object.__setattr__(self, "_br_f", f)
+        object.__setattr__(self, "_br_done", False)
+
+    def _br_get(self):
+        if not object.__getattribute__(self, "_br_done"):
+            v = object.__getattribute__(self, "_br_f")()
+            object.__setattr__(self, "_br_v", v)
+            object.__setattr__(self, "_br_done", True)
+        return object.__getattribute__(self, "_br_v")
+
+    @property
+    def __class__(self):
+        return self._br_get().__class__
+
+    def __getattr__(self, name):
+        return getattr(self._br_get(), name)
+
+    def __setattr__(self, name, value):
+        setattr(self._br_get(), name, value)
+
+    def __eq__(self, other):
+        return self._br_get() == other
+
+    def __ne__(self, other):
+        return self._br_get() != other
+
+    def __hash__(self):
+        return hash(self._br_get())
+
+    def __repr__(self):
+        return repr(self._br_get())
+
+    def __str__(self):
+        return str(self._br_get())
+
+    def __bool__(self):
+        return bool(self._br_get())
+
+    def __iter__(self):
+        return iter(self._br_get())
+
+    def __len__(self):
+        return len(self._br_get())
+
+    def __getitem__(self, k):
+        return self._br_get()[k]
+
+    def __contains__(self, k):
+        return k in self._br_get()
+
+    def __call__(self, *a, **k):
+        return self._br_get()(*a, **k)
+
+
+def _filter_calls(allowed):
+    """Run only the allowed top-level validate_* calls of a Validator test; the
+    others return a lazy stand-in that runs them if their result is used."""
+    V = importlib.import_module("tests.dialects.test_dialect").Validator
+    state = {"n": 0, "depth": 0}
+    saved = {}
+
+    def run(orig, self, a, k):
+        state["depth"] += 1
+        try:
+            return orig(self, *a, **k)
+        finally:
+            state["depth"] -= 1
+
+    for name in VALIDATE:
+        orig = V.__dict__.get(name)
+        if orig is None:
+            continue
+        saved[name] = orig
+
+        def make(orig):
+            def wrapper(self, *a, **k):
+                if state["depth"]:
+                    return orig(self, *a, **k)
+                i = state["n"]
+                state["n"] += 1
+                if i in allowed:
+                    return run(orig, self, a, k)
+                return _Lazy(lambda: run(orig, self, a, k))
+            return wrapper
+
+        setattr(V, name, make(orig))
+
+    def restore():
+        for name, orig in saved.items():
+            setattr(V, name, orig)
+
+    return restore
+
+
+def _probe_case(tid, any_failed=False):
     """Cheap stand-ins for the two slowest tests.
 
     PROBE:tpcds:<i,j,...>  runs test_execute_tpcds on only those queries.
@@ -231,7 +335,10 @@ def _probe_case(tid):
     if kind == "tpcds":
         te = importlib.import_module("tests.test_executor")
         klass = te.TestExecutor
-        idx = [int(x) for x in arg.split(",") if x]
+        basic, _, extra = arg.partition("|")
+        idx = [int(x) for x in basic.split(",") if x]
+        if any_failed:
+            idx += [int(x) for x in extra.split(",") if x]
 
         def _br_probe(self):
             sub = [type(self).tpcds_sqls[i] for i in idx]
@@ -290,23 +397,36 @@ class _Result(unittest.TestResult):
         self.bad = True
 
 
-def run_tests(order, out_fd):
+def run_tests(order, out_fd, mass_stop=True):
     """order: list of (num, test_id).  Writes 'num status secs' lines to out_fd.
     Classes are set up once each and torn down at the end of their run."""
     w = os.fdopen(out_fd, "w", buffering=1)
     ready = []
+    any_failed = False
+    n_done = 0
+    n_bad = 0
     for num, tid in order:
+        is_probe = isinstance(tid, str) and tid.startswith("PROBE:")
+        if mass_stop and n_bad >= 3 and 2 * n_bad >= n_done and not is_probe:
+            w.write("%d S 0\n" % num)
+            continue      # a mass breakage: leave the rest scheduled, but still run the probes
         t0 = time.process_time()
         restore = None
         try:
-            if isinstance(tid, tuple):            # ("FILTER", test id, allowed items)
+            if isinstance(tid, tuple) and tid[0] == "CALLS":   # ("CALLS", test id, allowed call numbers)
+                klass, meth = load_case(tid[1])
+                restore = _filter_calls(tid[2])
+            elif isinstance(tid, tuple):            # ("FILTER", test id, allowed items)
                 klass, meth = load_case(tid[1])
                 restore = _filter_fixtures(tid[1], tid[2])
             elif tid.startswith("PROBE:"):
-                klass, meth = _probe_case(tid)
+                klass, meth = _probe_case(tid, any_failed)
             else:
                 klass, meth = load_case(tid)
         except BaseException:
+            any_failed = True
+            n_done += 1
+            n_bad += 1
             w.write("%d F %.4f\n" % (num, time.process_time() - t0))
             continue
         if klass not in ready:
@@ -317,6 +437,9 @@ def run_tests(order, out_fd):
             except BaseException:
                 klass._br_setup_failed = True
         if getattr(klass, "_br_setup_failed", False):
+            any_failed = True
+            n_done += 1
+            n_bad += 1
             w.write("%d F %.4f\n" % (num, time.process_time() - t0))
             continue
         res = _Result()
@@ -328,6 +451,9 @@ def run_tests(order, out_fd):
             bad = True
         if restore is not None:
             restore()
+        any_failed = any_failed or bad
+        n_done += 1
+        n_bad += bool(bad)
         w.write("%d %s %.4f\n" % (num, "F" if bad else "P", time.process_time() - t0))
     for klass in ready:
         _teardown(klass)
@@ -474,7 +600,7 @@ def child_main(warm, job, out_fd):
                 except BaseException:
                     pass
             install_sync_pools()
-        run_tests(job["order"], out_fd)
+        run_tests(job["order"], out_fd, mass_stop=job.get("stop_on_fail", True))
     except BaseException:
         pass
     os._exit(0)
@@ -545,10 +671,6 @@ def run_jobs(warm, jobs, parallel=2, log=None, deadline=None):
                         a.t_last = now
                         if st == "T":
                             a.done = True
-                        elif st != "P" and a.stop_on_fail:
-                            nf = sum(1 for v in a.results.values() if v != "P")
-                            if nf >= 3 and 2 * nf >= len(a.results):
-                                a.done = True     # a mass breakage: keep the rest blind
             if not a.done:
                 # time limit for the test in progress
                 if a.next_idx < len(a.order):

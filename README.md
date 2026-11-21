@@ -25,12 +25,23 @@ Picks the sqlglot tests a patch can break, and splits them across workers.
    pass are dropped. Tests that fail, time out or are never reached are kept.
    - **Fixture-driven tests** (`casemap.bin`), such as `check_file`, identity
      and annotate fixtures, run only the fixture items whose recorded coverage
-     or class usage reaches the change.
+     or class usage reaches the change. When a fixture file itself is edited,
+     it is split the way the test helpers split it, and only the items that
+     differ are run.
+   - **Dialect tests** (`callmap.bin`) are mostly long runs of
+     `validate_identity` / `validate_all` calls. They run only the calls whose
+     recorded coverage or class usage reaches the change. Each other call
+     returns a lazy stand-in that runs the real call if the test uses its
+     result. If a changed line or class is used by most of a test's calls, or
+     outside them, the whole test runs.
+   - **Source read as text.** When a test reads a source file as text (for
+     example, `test_typing`), it is served the patched text.
    - **The two slowest tests** (`probes.bin`) are stood in for by probes.
      `test_execute_tpcds` runs only a few of the TPC-DS queries that execute
      the changed lines. `test_max_nodes` runs its own checks on a smaller
      query. If a changed line is run by the real test but neither by the
-     probe nor by at least 20 other tests, the real test is kept.
+     probe nor by at least 20 other tests, the real test is kept. An edit to
+     the TPC-DS fixture probes exactly the queries that changed.
 3. **Cost model** (`selector.py`). Per commit, verify the candidates whose CPU
    (`costs.json`) is less than what scheduling them blind would cost. After a
    failure, verification carries on unless at least half of what has run
@@ -58,6 +69,7 @@ commit:
 | `map.bin` | `covone.py` + `sitecustomize.py` (per-test line coverage), then `buildmap.py` and `packmap.py` |
 | class bits in `map.bin` | `typeuse.py` (classes each test uses), `family.py`, `buildcls.py` |
 | `casemap.bin` | `casecov.py`, `buildcases.py` |
+| `callmap.bin` | `callcov.py`, `skipall.py` (drops tests that cannot run with calls skipped) |
 | `probes.bin` | `tpcds_cov.py`, `probecal.py`, `probe_check.py`, `buildprobes.py` |
 | `costs.json` | `measure.py` |
 
