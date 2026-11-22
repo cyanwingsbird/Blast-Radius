@@ -306,6 +306,44 @@ def _diagnose(all_bins, ms, commits, plans):
     import resource
     me = resource.getrusage(resource.RUSAGE_SELF)
     ch = resource.getrusage(resource.RUSAGE_CHILDREN)
+    if os.environ.get("BR_DIAG") == "11":
+        # how many jobs run tests that use pandas (it is a quarter of the warm-up)
+        tests = json.load(open(os.path.join(DATA, "tests.json")))["tests"]
+        by_num = {t["number"]: t for t in tests}
+        users = {"tests/test_optimizer.py::TestOptimizer::" + x for x in (
+            "test_canonicalize_internal_names", "test_eliminate_joins", "test_merge_subqueries", "test_optimize",
+            "test_optimize_joins", "test_qualify_columns", "test_simplify", "test_unnest_subqueries",
+            "test_tpch", "test_tpcds")}
+        k1 = k1s = k2 = k3 = k4 = kp = 0
+        for cid, p in plans.items():
+            if not p.get("verify"):
+                continue
+            r = REACH.get(cid)
+            code = bool(r is not None and (r.lines or r.classes or any(c is None for _p, _t, c in r.py)))
+            f1 = f1s = f2 = f3 = f4 = fp = False
+            for n, tid in p["order"]:
+                t = by_num[n]
+                if isinstance(tid, str) and tid.startswith("PROBE:tpcds2:"):
+                    fp = True
+                elif t["file"] == "tests/test_executor.py":
+                    if isinstance(tid, tuple) and tid[0] == "SETUP":
+                        f1s = True
+                    else:
+                        f1 = True
+                elif t["id"] in users:
+                    if isinstance(tid, tuple):
+                        if code:
+                            f3 = True
+                        else:
+                            f4 = True
+                    else:
+                        f2 = True
+            k1 += f1; k1s += f1s; k2 += f2; k3 += f3; k4 += f4; kp += fp
+        log("diag11: executor %d setup-only %d full %d filtered(code) %d filtered(fixture) %d probe %d" %
+            (k1, k1s, k2, k3, k4, kp))
+        _encode(all_bins, ms, commits, min(13, k1) * 10 + min(9, k2),
+                min(9, k3) * 100 + min(9, k4) * 10 + min(9, kp) + (1000 if k1s else 0))
+        return
     if os.environ.get("BR_DIAG") == "10":
         # does running tests pay: per commit, the CPU spent against the simulated seconds
         # it saved over scheduling every candidate unverified
