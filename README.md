@@ -108,6 +108,8 @@ Picks the sqlglot tests a patch can break, and splits them across workers.
    `__getattr__` hooks read only the names their tables list, and
    `test_lazy_load`, which only runs `import sqlglot` in a new interpreter, is
    dropped when the patch is outside the files that import loads.
+   A changed source file that a test also reads as text (the typing
+   modules) is narrowed the same way; the test that reads it is kept.
 4. **Comparison operators** (`analyze.py`, `cmpmap.bin`). When a patch only
    swaps the operator of comparisons inside functions (`is` for `==`, `<` for
    `<=`, ...), a test can only notice if it compares a pair of values that the

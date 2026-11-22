@@ -617,13 +617,19 @@ def narrow_by_data(plans, reach, answers, tests, map_nums, unmapped, ms, run_cos
     that can see those values.  Returns the warm parent state, or None."""
     todo = []
     for cid, (r, cand, reimport, _rc) in reach.items():
-        if not reimport or not r.py or r.data or not r.runnable:
+        if not reimport or not r.py or not r.runnable:
+            continue
+        # (a changed source file that a test also reads as text is fine: that test is kept below)
+        if r.data and (os.environ.get("BR_NO_SRCDATA") or
+                       not {p for p, _t in r.data} <= {p for p, _t, _c in r.py}):
             continue
         if any(p.startswith("tests/") for p, _t, _c in r.py):
             continue
         if sum(run_cost[n] for n in cand) < DIFF_MIN:
             continue
         todo.append(cid)
+    if os.environ.get("BR_PROF"):
+        log("data diff candidates: %d of %d" % (len(todo), len(reach)))
     if not todo:
         return None
     import runner
@@ -660,6 +666,14 @@ def narrow_by_data(plans, reach, answers, tests, map_nums, unmapped, ms, run_cos
             continue
         r, cand, reimport, run_cost = reach[cid]
         keep = set(unmapped)
+        for path, _text in r.data:
+            ob = ctx["mp"].opens.get(path, 0)
+            i = 0
+            while ob:
+                if ob & 1 and map_nums[i] is not None:
+                    keep.add(map_nums[i])
+                ob >>= 1
+                i += 1
         i = 0
         while bits:
             if bits & 1 and map_nums[i] is not None:
