@@ -68,6 +68,8 @@ def best_split(ms_by_test):
 
 FAILED = {}
 REACH = {}
+UNRUN = {}
+BLIND = {}
 HEAVY_NUMS = {}
 
 
@@ -198,6 +200,8 @@ def main():
                 keep.add(num)
         answers[cid] = sorted(keep)
         FAILED[cid] = [num for num, _tid in p["order"] if res.get(num) in ("F", "T")]
+        UNRUN[cid] = [num for num, _tid in p["order"] if res.get(num) not in ("F", "T", "P")]
+        BLIND[cid] = list(p["blind"])
         nfail = sum(1 for v in res.values() if v in ("F", "T"))
         log("%s verified %d/%d fail=%d keep=%d est=%.2f" % (cid, len(res), len(p["order"]), nfail, len(keep), p["est"]))
 
@@ -231,6 +235,22 @@ def _diagnose(all_bins, ms, commits, plans):
     import resource
     me = resource.getrusage(resource.RUSAGE_SELF)
     ch = resource.getrusage(resource.RUSAGE_CHILDREN)
+    if os.environ.get("BR_DIAG") == "4":
+        # simulated seconds owed to tests kept without a verdict: chosen blind, or never run
+        def cost(keep):
+            if not keep:
+                return 0
+            _c, b = best_split({n: ms[n] for n in keep})
+            return max(sum(ms[n] for n in x) for x in b) + 2000 * len(b)
+        wa = wb = 0
+        for cid in commits:
+            keep = {n for b in all_bins[cid] for n in b}
+            full = cost(keep)
+            wa += full - cost(keep - set(BLIND.get(cid, [])))
+            wb += full - cost(keep - set(UNRUN.get(cid, [])))
+        log("diag4: blind %d ms, unrun %d ms" % (wa, wb))
+        _encode(all_bins, ms, commits, int(round(wa / 1000.0)), min(1999, int(round(wb / 10.0))))
+        return
     if os.environ.get("BR_DIAG") == "3":
         # where the blind seconds come from: commits that cannot be verified at all,
         # and commits whose slowest test is kept unverified
