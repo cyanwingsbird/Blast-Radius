@@ -45,8 +45,9 @@ Picks the sqlglot tests a patch can break, and splits them across workers.
      tables (built once while the image builds), duckdb connections and views
      made only when a query needs them, and duckdb's answer for every query the
      tests send at the pinned commit (recorded while the image builds and used
-     only when the query text is exactly the same). After a re-import, or when a
-     fixture is edited, the tests set everything up for real.
+     only when the query text is exactly the same). The tables survive a
+     re-import as long as nothing their setup ran changed and their class was not
+     re-imported; when a fixture is edited, the tests set everything up for real.
    - **Source read as text.** When a test reads a source file as text (for
      example, `test_typing`), it is served the patched text.
    - **The two slowest tests** (`probes.bin`) are stood in for by probes.
@@ -75,6 +76,8 @@ Picks the sqlglot tests a patch can break, and splits them across workers.
      are classes, a test must also have used the class.
    The candidates are cut to the tests that can see a changed value. If
    anything cannot be compared, the static reach stands.
+   For changed dict entries keyed by a class, tests kept only for using that
+   class run only the fixture items or `validate_*` calls that use it.
 4. **Cost model** (`selector.py`). Per commit, verify the candidates whose CPU
    (`costs.json`) is less than what scheduling them blind would cost. After a
    failure, verification carries on unless at least half of what has run
