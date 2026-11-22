@@ -375,6 +375,10 @@ def _probe_case(tid, any_failed=False):
         klass = tp.TestParser
         klass._br_probe = _max_nodes_probe
         return klass, "_br_probe"
+    if kind == "setup":
+        te = importlib.import_module("tests.test_executor")
+        te.TestExecutor._br_probe = lambda self: None
+        return te.TestExecutor, "_br_probe"
     if kind == "tpcds2":
         te = importlib.import_module("tests.test_executor")
         parts = arg.split("|")
@@ -567,13 +571,16 @@ def run_tests(order, out_fd, mass_stop=True, dyn=None):
                 kept.append(t_ms)
                 w.write("%d S 0\n" % num)
                 continue
-        if mass_stop and n_bad >= MASS_N and n_bad >= MASS_F * n_done and not is_probe:
+        is_setup = isinstance(tid, tuple) and tid[0] == "SETUP"
+        if mass_stop and n_bad >= MASS_N and n_bad >= MASS_F * n_done and not is_probe and not is_setup:
             w.write("%d S 0\n" % num)
             continue      # a mass breakage: leave the rest scheduled, but still run the probes
         t0 = time.process_time()
         restore = None
         try:
-            if isinstance(tid, tuple) and tid[0] == "CALLS":   # ("CALLS", test id, allowed call numbers)
+            if is_setup:                           # ("SETUP", test id, None): only its class setup matters
+                klass, meth = load_case(tid[1])
+            elif isinstance(tid, tuple) and tid[0] == "CALLS":   # ("CALLS", test id, allowed call numbers)
                 klass, meth = load_case(tid[1])
                 restore = _filter_calls(tid[2])
             elif isinstance(tid, tuple):            # ("FILTER", test id, allowed items)
@@ -607,6 +614,10 @@ def run_tests(order, out_fd, mass_stop=True, dyn=None):
             if dyn and num in dyn["ms"]:
                 kept.append(dyn["ms"][num])
             w.write("%d F %.4f\n" % (num, time.process_time() - t0))
+            continue
+        if is_setup:
+            n_done += 1
+            w.write("%d P %.4f\n" % (num, time.process_time() - t0))
             continue
         res = _Result()
         try:
@@ -946,10 +957,12 @@ class Warm:
                     if fn.__code__.co_code == old.co_code:
                         fn.__code__ = new
         install_data_overlay({os.path.join(ROOT, rel): text for rel, text in data})
-        if not reimport and self.exec_cache is not None and not data:
+        sql_only = bool(data) and all(rel in SQL_FIXTURES for rel, _t in data) and not os.environ.get("BR_NO_SQLONLY")
+        if not reimport and self.exec_cache is not None and (not data or sql_only):
             touched = {_ckey(old) for old, _new in swaps}
             if not (touched & self.exec_cache["codes"]):
-                _use_exec_cache(self.exec_cache)
+                # (an edited query file: the tables are the same, the queries are read again)
+                _use_exec_cache(self.exec_cache, reload_sqls=sql_only)
         elif reimport and use_cache and self.exec_cache is not None and not data:
             # the tables are still good when nothing their setup ran changed and their
             # class was not re-imported
@@ -1438,7 +1451,10 @@ class _LazyConn:
         return self._br_get().__exit__(*a)
 
 
-def _use_exec_cache(cache):
+SQL_FIXTURES = ("tests/fixtures/optimizer/tpc-h/tpc-h.sql", "tests/fixtures/optimizer/tpc-ds/tpc-ds.sql")
+
+
+def _use_exec_cache(cache, reload_sqls=False):
     import duckdb
     import tests.test_executor as te
     from tests.helpers import TPCH_SCHEMA, TPCDS_SCHEMA
@@ -1450,7 +1466,11 @@ def _use_exec_cache(cache):
         cls.tpch_tables = cache["tpch_tables"]
         cls.tpcds_tables = cache["tpcds_tables"]
         cls.cache = {}
-        cls.tpch_sqls = cache["tpch_sqls"]
-        cls.tpcds_sqls = cache["tpcds_sqls"]
+        if reload_sqls:
+            cls.tpch_sqls = list(te.load_sql_fixture_pairs("optimizer/tpc-h/tpc-h.sql"))
+            cls.tpcds_sqls = list(te.load_sql_fixture_pairs("optimizer/tpc-ds/tpc-ds.sql"))
+        else:
+            cls.tpch_sqls = cache["tpch_sqls"]
+            cls.tpcds_sqls = cache["tpcds_sqls"]
 
     te.TestExecutor.setUpClass = classmethod(setUpClass)

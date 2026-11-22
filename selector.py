@@ -156,8 +156,8 @@ def main():
             continue
         reimport = any(c is None for _p, _t, c in r.py) or _needs_reimport(r)
         # (an edited fixture changes the queries, so recorded duckdb results do not apply either)
-        exec_setup = r.data or any(p.startswith(("sqlglot/executor/", "tests/", "sqlglot/helper"))
-                                   for p, _t, _c in r.py)
+        exec_setup = (r.data and not _sql_only(r.data)) or \
+            any(p.startswith(("sqlglot/executor/", "tests/", "sqlglot/helper")) for p, _t, _c in r.py)
         costs_here = run_cost_reimport if exec_setup else run_cost
         plans[cid] = plan(cid, cand, r, ms, costs_here, setup_cost, by_num, reimport, ctx)
         reach[cid] = (r, cand, reimport, costs_here)
@@ -656,7 +656,10 @@ def heavy_probe(kind, num, r, ctx):
             new_items = _fixture_pairs(text)
             if len(new_items) != len(old_items):
                 return None
-            forced |= {i for i, item in enumerate(new_items) if item != old_items[i]}
+            # (the test reads each item's query and its meta line, not the expected output)
+            forced |= {i for i, item in enumerate(new_items) if item[0] != old_items[i][0]}
+            if not forced and not r.py and _sql_only(r.data):
+                return "PROBE:setup", 0.0, 0.0      # same queries: only the class setup can differ
             continue
         return None
     if kind == "genmem":
@@ -705,8 +708,9 @@ def heavy_probe(kind, num, r, ctx):
 
 
 SMALL_CHEAP = int(os.environ.get("BR_SMALL_CHEAP", "6"))
-SMALL_ROWS = int(os.environ.get("BR_SMALL_ROWS", "3"))
-SMALL_BIG = int(os.environ.get("BR_SMALL_BIG", "2"))
+SMALL_ROWS = int(os.environ.get("BR_SMALL_ROWS", "2"))
+SMALL_BIG = int(os.environ.get("BR_SMALL_BIG", "1"))
+SMALL_ALWAYS = tuple(int(x) for x in os.environ.get("BR_SMALL_ALWAYS", "33,34").split(",") if x)
 SMALL_ALL = int(os.environ.get("BR_SMALL_ALL", "12"))
 SMALL_ALL_SECS = float(os.environ.get("BR_SMALL_ALL_SECS", "1.0"))
 
@@ -755,6 +759,8 @@ def _small_probe(r, ctx, hbit, pr):
         ex = sorted(ex_pool, key=lambda i: sm["times"][i])[:SMALL_CHEAP]
         ex += sorted((i for i in ex_pool if i in sm["rows"] and i not in ex), key=lambda i: sm["times"][i])[:SMALL_ROWS]
         ex += sorted((i for i in ex_pool if i not in ex), key=lambda i: -pr["times"][i])[:SMALL_BIG]
+        # the queries with the deepest nesting of subqueries: where a plan goes wrong first
+        ex += [i for i in SMALL_ALWAYS if i in ex_pool and i not in ex]
     est = 0.08 + sum(pr["times"][i] for i in parse) + sum(sm["times"][i] for i in ex)
     pid = "PROBE:tpcds2:" + ",".join(map(str, sorted(parse))) + "|" + ",".join(map(str, sorted(ex))) + "|quiet"
     return pid, est, 0.0
@@ -911,9 +917,15 @@ def call_filter(tid, num, r, ctx):
     return allowed, est
 
 
+def _sql_only(data):
+    """Only the TPC query files changed: the executor tests' tables are as recorded."""
+    return bool(data) and all(p in (TPCH_FIXTURE, TPCDS_FIXTURE) for p, _t in data) and \
+        not os.environ.get("BR_NO_SQLONLY")
+
+
 def _setup(cls, setup_cost, reimport, data):
     sc = setup_cost.get(cls, 0.0)
-    if cls == EXEC_CLASS and not reimport and not data:
+    if cls == EXEC_CLASS and not reimport and (not data or _sql_only(data)):
         sc = 0.1     # tables come from the parent's cache
     return sc
 
@@ -956,6 +968,20 @@ def plan(cid, cand, r, ms, run_cost, setup_cost, by_num, reimport, ctx):
     if alpha != 1.0:
         run_cost = {k: v * alpha for k, v in run_cost.items()}
     spec = {}
+    if verifiable and not py and data and all(p in (TPCH_FIXTURE, TPCDS_FIXTURE) for p, _t in data) \
+            and not os.environ.get("BR_NO_SETUPONLY"):
+        # the TPC query files are read by TestExecutor's class setup, but only these
+        # tests look at the queries: for the rest it is enough that the setup still works
+        users = set()
+        if any(p == TPCH_FIXTURE for p, _t in data):
+            users |= {"test_execute_tpch", "test_optimized_tpch"}
+        if any(p == TPCDS_FIXTURE for p, _t in data):
+            users |= {"test_execute_tpcds"}
+        for n in can:
+            tid = by_num[n]["id"]
+            if tid.startswith(EXEC_CLASS + "::") and tid.rsplit("::", 1)[1] not in users:
+                spec[n] = ("SETUP", tid, None)
+                run_cost[n] = 0.0005
     by_class = ctx.get("by_class", {}).get(cid)
     if by_class is not None and verifiable and not test_code:
         # tests kept only for using a class whose dict entry changed: only the

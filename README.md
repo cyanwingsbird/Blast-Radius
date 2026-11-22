@@ -64,6 +64,14 @@ Picks the sqlglot tests a patch can break, and splits them across workers.
      recorded time counts as a failure: a join gone cross kills the real
      test's worker. A changed line only the full tables reach falls back to
      the older probe.
+     Two queries with the deepest nesting of subqueries are always among
+     them: on mutants a plan gone wrong showed there first.
+   - **The TPC query files.** `TestExecutor`'s class setup reads them, but
+     only three of its tests look at the queries. When a patch changes just
+     those files, the other tests of the class only need the setup to still
+     work, the recorded tables are reused with the queries read again, and
+     `test_execute_tpcds` is unaffected when no query text or meta line
+     changed.
    - **`test_generator_memory`** with a quarter of the measured loop and of
      the allowance.
    - **The two slowest tests** (`probes.bin`) are stood in for by probes.
