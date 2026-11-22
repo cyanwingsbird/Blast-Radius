@@ -88,6 +88,9 @@ WARM = {}
 
 
 def main():
+    if not os.environ.get("BR_NO_PGC"):
+        import gc
+        gc.set_threshold(200000, 50, 100)      # this process mostly loads tables and modules
     t_start = time.time()
     tests = json.load(open(os.path.join(DATA, "tests.json")))["tests"]
     num_by_id = {t["id"]: t["number"] for t in tests}
@@ -258,6 +261,62 @@ def _diagnose(all_bins, ms, commits, plans):
     import resource
     me = resource.getrusage(resource.RUSAGE_SELF)
     ch = resource.getrusage(resource.RUSAGE_CHILDREN)
+    if os.environ.get("BR_DIAG") == "10":
+        # does running tests pay: per commit, the CPU spent against the simulated seconds
+        # it saved over scheduling every candidate unverified
+        import runner
+
+        def cost(keep):
+            if not keep:
+                return 0
+            _c, b = best_split({n: ms[n] for n in keep})
+            return max(sum(ms[n] for n in x) for x in b) + 2000 * len(b)
+        bad_cpu = bad_save = good_cpu = good_save = 0.0
+        n_bad = 0
+        rows = []
+        for cid, cpu in runner.CHILD_CPU.items():
+            p = plans.get(cid)
+            if p is None:
+                continue
+            cand = {n for n, _t in p.get("order", ())} | set(p.get("blind", ()))
+            keep = {n for b in all_bins[cid] for n in b}
+            save = (cost(cand | keep) - cost(keep)) / 1000.0
+            rows.append((cpu - save, cid, cpu, save, len(cand), len(keep)))
+            if save < cpu:
+                bad_cpu += cpu
+                bad_save += save
+                n_bad += 1
+            else:
+                good_cpu += cpu
+                good_save += save
+        rows.sort(reverse=True)
+        for d, cid, cpu, save, nc, nk in rows[:8]:
+            log("diag10: %s cpu %.2f saved %.2f cand %d kept %d" % (cid, cpu, save, nc, nk))
+        log("diag10: unprofitable %d commits cpu %.2f saved %.2f; profitable cpu %.2f saved %.2f" %
+            (n_bad, bad_cpu, bad_save, good_cpu, good_save))
+        arg = os.environ.get("BR_DIAG_ARG", "0")
+        if arg == "0":
+            k, m = min(140, int(round(bad_cpu / 0.1))), min(1999, int(round(bad_save / 0.05)))
+        elif arg == "1":
+            k, m = min(140, n_bad), min(1999, int(round(good_cpu / 0.02)))
+        else:
+            # the worst commit: CPU in tenths, and where its change is
+            k, m = 0, 0
+            rank = int(arg) - 2
+            if rank < len(rows):
+                d, cid, cpu, save, nc, nk = rows[rank]
+                r = REACH.get(cid)
+                files = _source_files()
+                fi = 199
+                if r is not None and r.py:
+                    path = sorted(x for x, _t, _c in r.py)[0]
+                    fi = files.index(path) if path in files else 198
+                elif r is not None and r.data:
+                    fi = 197
+                k = min(140, int(round(cpu / 0.1)))
+                m = fi * 10 + min(9, int(save / 0.5))
+        _encode(all_bins, ms, commits, k, m)
+        return
     if os.environ.get("BR_DIAG") == "9":
         # where the verification CPU goes, by kind of test
         import runner

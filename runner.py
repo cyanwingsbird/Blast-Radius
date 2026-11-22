@@ -448,12 +448,13 @@ def _small_tpcds_probe(self, te, parse_idx, exec_idx):
             use[name] = tables[name]
         # a plan that explodes (a join gone cross) kills the real test's worker on the
         # full tables; here it shows as a query taking many times what it did
-        signal.signal(signal.SIGALRM, _blowup)
-        signal.setitimer(signal.ITIMER_REAL, max(SMALL_LIMIT, 10.0 * want["time"]))
+        # (CPU time of this process, so a stalled machine does not look like a blow-up)
+        signal.signal(signal.SIGVTALRM, _blowup)
+        signal.setitimer(signal.ITIMER_VIRTUAL, max(SMALL_LIMIT, 10.0 * want["time"]))
         try:
             got = execute(expression, schema=te.TPCDS_SCHEMA, tables=use)
         finally:
-            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.setitimer(signal.ITIMER_VIRTUAL, 0)
         if transpile(sql, write="duckdb")[0] != want["duck"]:
             raise AssertionError("query %d: duckdb is sent other SQL" % i)
         if tuple(got.columns) == want["columns"] and list(got.rows) == want["rows"]:
@@ -979,9 +980,9 @@ class Warm:
 
 def child_main(warm, job, out_fd):
     """job: dict with py, data, order."""
-    if os.environ.get("BR_GC"):
-        a, b, c = (int(x) for x in os.environ["BR_GC"].split(","))
-        gc.set_threshold(a, b, c)
+    # fewer young-generation passes: the tests build many short-lived trees
+    a, b, c = (int(x) for x in os.environ.get("BR_GC", "50000,20,100").split(","))
+    gc.set_threshold(a, b, c)
     devnull = os.open(os.devnull, os.O_WRONLY)
     os.dup2(devnull, 1)
     os.dup2(devnull, 2)

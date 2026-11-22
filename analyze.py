@@ -365,6 +365,12 @@ def _cmp_truth(op, cls):
 def _cmp_swaps(old_text, new_text):
     """[(line, col, old operator, new operator)] when the sources differ only in the
     operator of one-operator comparisons; None otherwise."""
+    a_lines, b_lines = old_text.split("\n"), new_text.split("\n")
+    if len(a_lines) == len(b_lines):
+        # (the usual case, checked on the changed lines alone before anything is parsed)
+        for x, y in zip(a_lines, b_lines):
+            if x != y and _CMP_TOKEN.sub("?", x) != _CMP_TOKEN.sub("?", y):
+                return None
     if _CMP_TOKEN.sub("?", old_text) != _CMP_TOKEN.sub("?", new_text):
         # (comment-only lines added next to the swap are tolerated below)
         strip = lambda t: "\n".join(l for l in _CMP_TOKEN.sub("?", t).split("\n") if not l.lstrip().startswith("#"))
