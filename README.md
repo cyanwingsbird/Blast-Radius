@@ -86,6 +86,8 @@ Picks the sqlglot tests a patch can break, and splits them across workers.
      query. If a changed line is run by the real test but neither by the
      probe nor by at least 20 other tests, the real test is kept. An edit to
      the TPC-DS fixture probes exactly the queries that changed.
+   One child runs at a time: only CPU seconds count, and on the board two at
+   once used more of them.
    `tests/test_sqlglotc.py` is not imported up front: it loads no sqlglot
    module, only setuptools, which costs as much as all the other test modules
    together (a job that runs it imports it itself).

@@ -993,10 +993,17 @@ class Warm:
     def load_tpcds(self):
         _unpack_tpcds(self.exec_cache)
 
+    def revert(self):
+        """Put back the function bodies the last apply() swapped (batch children)."""
+        for fn, code in reversed(self.undo):
+            fn.__code__ = code
+        self.undo = []
+
     def apply(self, py, data, sig, load_old, use_cache=True):
         """In the child: make the patched sources live.  py: [(rel, text, new_code)]."""
         reimport = False
         swaps = []
+        self.undo = []
         for rel, text, new_code in py:
             name = modname(rel)
             if new_code is None or name not in sys.modules:
@@ -1020,6 +1027,7 @@ class Warm:
             for old, new in swaps:
                 for fn in self.funcs.get(_ckey(old), ()):
                     if fn.__code__.co_code == old.co_code:
+                        self.undo.append((fn, fn.__code__))
                         fn.__code__ = new
         install_data_overlay({os.path.join(ROOT, rel): text for rel, text in data})
         sql_only = bool(data) and all(rel in SQL_FIXTURES for rel, _t in data) and not os.environ.get("BR_NO_SQLONLY")
@@ -1074,6 +1082,155 @@ def child_main(warm, job, out_fd):
     except BaseException:
         pass
     os._exit(0)
+
+
+def batch_main(warm, jobs, out_fd):
+    """Child: several commits one after another, each with only function bodies swapped
+    in (and swapped back afterwards).  One 'DONE' line ends each commit's results; a
+    commit that turns out to need a re-import is run last, followed by 'DIRTY'."""
+    a, b, c = (int(x) for x in os.environ.get("BR_GC", "50000,20,100").split(","))
+    gc.set_threshold(a, b, c)
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    os.dup2(devnull, 1)
+    os.dup2(devnull, 2)
+    try:
+        import analyze
+        for _cid, job in jobs:
+            sys.stdout = io.StringIO()
+            sys.stderr = io.StringIO()
+            opens = (builtins.open, io.open)
+            dirty = True
+            wrote = False
+            try:
+                dirty = warm.apply(job["py"], job["data"], analyze._sig,
+                                   lambda rel: analyze.load_old_code(ROOT, rel, open(os.path.join(ROOT, rel)).read()))
+                if dirty:
+                    install_sync_pools()
+                    for _num, tid in job["order"]:
+                        try:
+                            load_case(tid)
+                        except BaseException:
+                            pass
+                    install_sync_pools()
+                _DEFER_DUCK["on"] = not os.environ.get("BR_NO_DEFER") and \
+                    not any(rel.startswith("tests/") for rel, _t, _c in job["py"])
+                run_tests(job["order"], os.dup(out_fd), mass_stop=job.get("stop_on_fail", True), dyn=job.get("dyn"))
+                wrote = True
+            except BaseException:
+                pass
+            if not wrote:
+                os.write(out_fd, b"DONE\n")
+            if dirty:
+                os.write(out_fd, b"DIRTY\n")
+                break
+            warm.revert()
+            builtins.open, io.open = opens      # (a data file overlay)
+    except BaseException:
+        pass
+    os._exit(0)
+
+
+def run_batches(warm, batches, parallel=1, log=None, deadline=None):
+    """batches: lists of (cid, job) to run in one child each.  Returns {cid: {num: status}}
+    like run_jobs.  What a child that died or was killed had not started is run again in
+    a new child."""
+    import select
+    pending = [list(b) for b in batches if b]
+    if not os.environ.get("BR_NO_FREEZE"):
+        gc.freeze()
+    active = []
+    out = {}
+    while pending or active:
+        if deadline is not None and time.time() > deadline:
+            for a in active:
+                a["dead"] = True
+            pending = []
+        while pending and len(active) < parallel:
+            jobs = pending.pop(0)
+            r, w = os.pipe()
+            pid = os.fork()
+            if pid == 0:
+                os.close(r)
+                batch_main(warm, jobs, w)
+                os._exit(0)
+            os.close(w)
+            os.set_blocking(r, False)
+            active.append({"pid": pid, "fd": r, "jobs": jobs, "idx": 0, "res": {}, "next": 0, "buf": "",
+                           "t_last": time.monotonic(), "dead": False, "eof": False, "dirty": False,
+                           "started": time.monotonic()})
+        ready, _, _ = select.select([a["fd"] for a in active], [], [], 0.05)
+        now = time.monotonic()
+        for a in list(active):
+            if a["fd"] in ready:
+                try:
+                    chunk = os.read(a["fd"], 65536).decode()
+                except BlockingIOError:
+                    chunk = None
+                if chunk == "":
+                    a["eof"] = True
+                elif chunk:
+                    a["buf"] += chunk
+                    while "\n" in a["buf"]:
+                        line, a["buf"] = a["buf"].split("\n", 1)
+                        if line == "DIRTY":
+                            a["dirty"] = True
+                            continue
+                        if line == "DONE":
+                            if a["idx"] < len(a["jobs"]):
+                                out[a["jobs"][a["idx"]][0]] = a["res"]
+                            a["idx"] += 1
+                            a["res"] = {}
+                            a["next"] = 0
+                            a["t_last"] = now
+                            continue
+                        num, st, _secs = line.split()
+                        a["res"][int(num)] = st
+                        if a["idx"] < len(a["jobs"]):
+                            try:
+                                TEST_SECS[(a["jobs"][a["idx"]][0], int(num))] = float(_secs)
+                            except ValueError:
+                                pass
+                        a["next"] += 1
+                        a["t_last"] = now
+            finished = a["idx"] >= len(a["jobs"])
+            if not finished and not a["eof"] and not a["dead"] and not a["dirty"]:
+                # time limit for the test in progress
+                cid, job = a["jobs"][a["idx"]]
+                if a["next"] < len(job["order"]):
+                    num = job["order"][a["next"]][0]
+                    if now - a["t_last"] > job["limits"].get(num, 5.0):
+                        a["res"][num] = "T"
+                        a["dead"] = True
+            if finished or a["eof"] or a["dead"] or (a["dirty"] and a["eof"]):
+                try:
+                    os.kill(a["pid"], signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                cpu = -1.0
+                try:
+                    _p, _st, ru = os.wait4(a["pid"], 0)
+                    cpu = ru.ru_utime + ru.ru_stime
+                except ChildProcessError:
+                    pass
+                os.close(a["fd"])
+                active.remove(a)
+                rest = []
+                if not finished:
+                    # the commit in progress keeps what it has; the ones after it start over
+                    cid = a["jobs"][a["idx"]][0]
+                    if cid not in out:
+                        out[cid] = a["res"]
+                    rest = a["jobs"][a["idx"] + 1:]
+                if a["jobs"]:
+                    CHILD_CPU[a["jobs"][0][0]] = cpu
+                    for cid, _j in a["jobs"][1:]:
+                        CHILD_CPU.setdefault(cid, 0.0)
+                if rest and not (deadline is not None and time.time() > deadline):
+                    pending.insert(0, rest)
+                if log:
+                    log("ran batch of %d (%d left over) in %.2fs cpu %.2f" %
+                        (len(a["jobs"]), len(rest), now - a["started"], cpu))
+    return out
 
 
 def diff_main(warm, py, out_fd):

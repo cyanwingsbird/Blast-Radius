@@ -232,9 +232,28 @@ def main():
 
         # the jobs that do not need the executor tables run first, forked from a process
         # that has not loaded them yet (20 MB of pickle; every fork carries what is loaded)
+        def as_job(p):
+            return {"py": p["py"], "data": p["data"], "order": p["order"],
+                    "limits": p["limits"], "stop_on_fail": True,
+                    "dyn": {"ms": {n: ms[n] for n, _t in p["order"]},
+                            "rc": {n: p["rc"].get(n, 0.0) for n, _t in p["order"]},
+                            "kept": [ms[n] for n in p["blind"]]}}
+
         results = {}
+        batched = set()
+        if BATCH > 1:
+            # commits that only swap function bodies or overlay a data file (nothing to
+            # re-import, no test code, no executor tables) share a child: the bodies are
+            # swapped back and the overlay is lifted after each one
+            group = [(cid, p) for cid, p in jobs if uses_tables(p) == 0 and not p.get("reimport") and
+                     not any(rel.startswith("tests/") for rel, _t, _c in p["py"])]
+            if len(group) > 1:
+                batched = {cid for cid, _p in group}
+                packs = [[(cid, as_job(p)) for cid, p in group[i:i + BATCH]] for i in range(0, len(group), BATCH)]
+                results.update(runner.run_batches(warm, packs, parallel=PARALLEL, log=log,
+                                                  deadline=t_start + TIME_BUDGET))
         for want in (0, 1, 2):
-            part = [(cid, p) for cid, p in jobs if uses_tables(p) == want]
+            part = [(cid, p) for cid, p in jobs if uses_tables(p) == want and cid not in batched]
             if not part:
                 continue
             if want:
@@ -712,7 +731,9 @@ def _calibrate():
 
 FIX_BLIND = int(os.environ.get("BR_FIX_BLIND", "0"))   # most tests a fixture-only change may leave unverified
 LATE_FILES = {"tests/test_sqlglotc.py"}
-PARALLEL = int(os.environ.get("BR_PAR", "2"))     # children at a time
+# children at a time: one, since CPU seconds are what counts and two at once cost more of them
+PARALLEL = int(os.environ.get("BR_PAR", "1"))
+BATCH = int(os.environ.get("BR_BATCH", "1"))      # commits per child, for those that only swap function bodies
 LAZY_PANDAS = int(os.environ.get("BR_LAZY_PANDAS", "0"))    # 2: not for filtered optimizer tests
 # the TestOptimizer tests that hand duckdb's answers to pandas (found by running each
 # one with the stand-in module in place)
