@@ -82,6 +82,12 @@ Picks the sqlglot tests a patch can break, and splits them across workers.
    anything cannot be compared, the static reach stands.
    For changed dict entries keyed by a class, tests kept only for using that
    class run only the fixture items or `validate_*` calls that use it.
+   A module-level name is matched by module, not only by spelling: a file
+   that binds its own global of the same name (and never imports one) can
+   mean the changed one only through `x.NAME` or a string. The packages' lazy
+   `__getattr__` hooks read only the names their tables list, and
+   `test_lazy_load`, which only runs `import sqlglot` in a new interpreter, is
+   dropped when the patch is outside the files that import loads.
 4. **Comparison operators** (`analyze.py`, `cmpmap.bin`). When a patch only
    swaps the operator of comparisons inside functions (`is` for `==`, `<` for
    `<=`, ...), a test can only notice if it compares a pair of values that the

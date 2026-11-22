@@ -47,6 +47,7 @@ class Source:
         self._tree = {}
         self._dyn = None
         self._occ = {}
+        self._own = {}
         self._load_index()
 
     def _load_index(self):
@@ -100,6 +101,51 @@ class Source:
             self._tree[path] = t
         return t
 
+    def own_lines(self, path, name):
+        """None, or -- when `path` binds its own module-level `name` and never imports
+        one -- the only lines where the word can mean another module's `name`:
+        attribute reads (x.NAME) and strings."""
+        k = (path, name)
+        if k in self._own:
+            return self._own[k]
+        res = None
+        try:
+            if name not in self.text(path):
+                self._own[k] = None
+                return None
+            tree = ast.parse(self.text(path))     # (not self.tree: nothing of it is kept)
+            binds = False
+            stack = list(tree.body)
+            while stack:
+                st = stack.pop()
+                if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    binds = binds or st.name == name
+                    continue
+                if isinstance(st, ast.Assign):
+                    binds = binds or any(isinstance(t, ast.Name) and t.id == name for t in st.targets)
+                elif isinstance(st, ast.AnnAssign):
+                    binds = binds or (isinstance(st.target, ast.Name) and st.target.id == name and st.value is not None)
+                for f in ("body", "orelse", "finalbody", "handlers"):
+                    stack.extend(getattr(st, f, None) or [])
+            if binds:
+                res = set()
+                for node in ast.walk(tree):
+                    if isinstance(node, (ast.Import, ast.ImportFrom)):
+                        if any(a.name == "*" or (a.asname or a.name).split(".")[0] == name for a in node.names):
+                            res = None
+                            break
+                    elif isinstance(node, ast.Global) and name in node.names:
+                        res = None
+                        break
+                    elif (isinstance(node, ast.Attribute) and node.attr == name) or \
+                            (isinstance(node, ast.Constant) and isinstance(node.value, (str, bytes)) and
+                             name in (node.value if isinstance(node.value, str) else node.value.decode("latin-1"))):
+                        res.update(range(node.lineno, (node.end_lineno or node.lineno) + 1))
+        except Exception:
+            res = None
+        self._own[k] = res
+        return res
+
     def token_lines(self, tok):
         """{path: set(lines)} for lines where `tok` appears as a word."""
         rx = re.compile(r"(?<![A-Za-z0-9_])" + re.escape(tok) + r"(?![A-Za-z0-9_])")
@@ -133,6 +179,8 @@ class Source:
                         if isinstance(a, ast.Constant) and isinstance(a.value, str):
                             continue        # a literal name: found by its token
                         pat = _name_pattern(a)
+                        if pat == ("any",) and isinstance(node.args[0], ast.Name) and node.args[0].id == "self":
+                            pat = ("self",)     # an instance's attribute, never a module's
                     elif fn in ("vars", "dir"):
                         pat = ("any",)
                 elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and \
@@ -324,6 +372,9 @@ def scan(tree, names, attr_only=False):
     return out
 
 
+NO_OWN = bool(os.environ.get("BR_NO_OWN"))
+
+
 class Narrower:
     def __init__(self, mp, src, keymap=None):
         self.mp = mp
@@ -334,6 +385,8 @@ class Narrower:
         n = len(mp.ids)
         self.no_types = ((1 << n) - 1) & ~u      # tests that use no class at all: always kept
         self.memo = {}
+        self._lazy = {}
+        self.touched = set()      # files the current patch changes
         self.keymap = keymap
         self.unrecorded = keymap["unrecorded"] if keymap is not None else 0
 
@@ -364,19 +417,47 @@ class Narrower:
                 b |= e[0] | e[1]
         return b
 
-    def dyn_bits(self, attr, module_level=True):
-        k = ("dyn", attr, module_level)
+    def dyn_bits(self, attr, module_level=True, keyed=False):
+        k = ("dyn", attr, module_level, keyed, frozenset(self.touched))
         if k in self.memo:
             return self.memo[k]
-        b = self._dyn_bits(attr, module_level)
+        b = self._dyn_bits(attr, module_level, keyed)
         self.memo[k] = b
         return b
 
-    def _dyn_bits(self, attr, module_level):
+    def lazy_names(self, path):
+        """The attribute names a package's lazy __getattr__ can read from a module:
+        the ones its own table lists.  None when unknown, or when the patch may have
+        changed the package file."""
+        if NO_OWN or path in self.touched:
+            return None
+        if path not in self._lazy:
+            names = None
+            try:
+                import sys
+                if path == "sqlglot/dialects/__init__.py":
+                    names = set(sys.modules["sqlglot.dialects"].MODULE_BY_ATTRIBUTE)
+                elif path == "sqlglot/optimizer/__init__.py":
+                    names = {a for _m, a in sys.modules["sqlglot.optimizer"]._LAZY_ATTRS.values()}
+            except Exception:
+                names = None
+            self._lazy[path] = names
+        return self._lazy[path]
+
+    def _dyn_bits(self, attr, module_level, keyed=False):
         b = 0
         for p, lines, pat in self.src.dyn():
             if pat[0] == "module" and not module_level:
                 continue
+            if pat[0] == "self" and module_level and not NO_OWN:
+                continue
+            if pat[0] == "module":
+                names = self.lazy_names(p)
+                if names is not None and attr not in names:
+                    continue
+                if keyed and p == "sqlglot/serde.py" and not NO_OWN and p not in self.touched:
+                    # serde calls what it reads: a dict or a set raises the same either way
+                    continue
             if pat[0] == "suffix" and not attr.endswith(pat[1]):
                 continue
             if pat[0] == "prefix" and not attr.startswith(pat[1]):
@@ -384,32 +465,49 @@ class Narrower:
             b |= self.call_bits(p, lines)
         return b
 
-    def token_bits(self, tok):
-        k = ("tok", tok)
+    def _foreign(self, p, lines, name, origin):
+        """`lines` of file p that can refer to module-level `name` of the file `origin`."""
+        if origin is None or p == origin:
+            return lines
+        own = self.src.own_lines(p, name)
+        return lines if own is None else lines & own
+
+    def token_bits(self, tok, origin=None):
+        k = ("tok", tok, origin)
         if k in self.memo:
             return self.memo[k]
         b = 0
         for p, lines in self.src.token_lines(tok).items():
-            b |= self.call_bits(p, lines)
+            lines = self._foreign(p, lines, tok, origin)
+            if lines:
+                b |= self.call_bits(p, lines)
         self.memo[k] = b
         return b
 
     def recorded(self, attr):
         return self.keymap is not None and attr in self.keymap["names"]
 
-    def opaque_bits(self, attr, resize=True):
+    def opaque_bits(self, attr, resize=True, origin=None):
         """Tests that read `attr` other than key by key (or, when the key map was
         recorded for it, other than through a recording site).  A read of its truth
         only counts when the change can alter its size."""
         rec = self.recorded(attr)
-        k = ("opq", attr, rec, resize)
+        k = ("opq", attr, rec, resize, origin)
         if k in self.memo:
             return self.memo[k]
         names = (attr,) + ALIASES.get(attr, ())
         b = 0
         seen = {}
-        for p, lines, kind, _alias in self.src.occurrences(set(names[:1])) + \
-                self.src.occurrences(set(names[1:]), attr_only=True):
+        first = self.src.occurrences(set(names[:1]))
+        skip = set()
+        for i, (p, lines, kind, _alias) in enumerate(first):
+            if origin is not None and p != origin and self.src.own_lines(p, attr) is not None:
+                # this file has its own module-level `attr`: only x.attr and strings there
+                # can mean ours, and the lines of those are counted below as opaque reads
+                skip.add(i)
+        for i, (p, lines, kind, _alias) in enumerate(first + self.src.occurrences(set(names[1:]), attr_only=True)):
+            if i in skip:
+                continue
             seen.setdefault(p, set()).update(lines)
             if kind == "opaque" or (kind == "callarg" and not rec) or (kind == "truth" and resize) or \
                     (kind == "deftime" and p.startswith("tests/")):
@@ -418,6 +516,8 @@ class Narrower:
         for name in names:
             for p, lines in self.src.token_lines(name).items():
                 rest = lines - seen.get(p, set())
+                if name == attr:
+                    rest = self._foreign(p, rest, attr, origin)
                 if rest:
                     b |= self.call_bits(p, rest)
         self.memo[k] = b
@@ -440,7 +540,7 @@ class Narrower:
         self.by_class = (0, set())
         seen_bits = 0
         seen_classes = set()
-        bits = self.no_types
+        bits = self.no_types if NO_OWN else 0
         done_attr = set()
         for e in entries:
             if e.get("opaque"):
@@ -457,6 +557,13 @@ class Narrower:
                         return None
                     bits |= self.call_bits(p, lines)
             module_level = ":" not in e["where"]
+            origin = None
+            if module_level and not NO_OWN:
+                origin = e["where"].replace(".", "/") + ".py"
+                if origin not in self.src.paths:
+                    origin = origin[:-3] + "/__init__.py"
+                    if origin not in self.src.paths:
+                        origin = None
             if keyed and self.recorded(attr):
                 resize = e.get("resize", True)
                 bits |= self.key_bits(attr, key[-1] if key[0] == "other" else key[3], resize)
@@ -464,8 +571,8 @@ class Narrower:
                     for c in [key[1]] + list(key[2]):
                         seen_bits |= self.mp.cls_bits.get(c, 0)
                         seen_classes.add(c)
-                bits |= self.opaque_bits(attr, resize)
-                bits |= self.dyn_bits(attr, module_level)
+                bits |= self.opaque_bits(attr, resize, origin)
+                bits |= self.dyn_bits(attr, module_level, True)
                 continue
             if keyed and key[0] == "class":
                 _k, cname, subs = key[:3]
@@ -473,13 +580,15 @@ class Narrower:
                     seen_bits |= self.mp.cls_bits.get(c, 0)
                     seen_classes.add(c)
                     bits |= self.token_bits(c.rsplit(":", 1)[1].rsplit(".", 1)[-1])
-                bits |= self.opaque_bits(attr)
-                bits |= self.dyn_bits(attr, module_level)
+                bits |= self.opaque_bits(attr, True, origin)
+                bits |= self.dyn_bits(attr, module_level, True)
                 continue
-            if ("any", attr) in done_attr:
+            if ("any", attr, origin) in done_attr:
                 continue
-            done_attr.add(("any", attr))
-            bits |= self.token_bits(attr)
+            done_attr.add(("any", attr, origin))
+            bits |= self.token_bits(attr, origin)
             bits |= self.dyn_bits(attr, module_level)
+        if seen_classes:
+            bits |= self.no_types     # the class rule knows nothing about tests that use no class
         self.by_class = (seen_bits & ~bits, seen_classes)
         return bits | seen_bits

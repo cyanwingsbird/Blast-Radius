@@ -947,6 +947,8 @@ def run_diffs(warm, items, parallel=2, deadline=None):
     """items: [(cid, py)].  Returns {cid: entries or None}."""
     import select
     pending = list(items)
+    if not os.environ.get("BR_NO_FREEZE"):
+        gc.freeze()     # what this process built since warming up is not the children's garbage
     active = {}
     out = {}
     while pending or active:
@@ -1011,6 +1013,8 @@ def run_jobs(warm, jobs, parallel=2, log=None, deadline=None):
     Returns {cid: {num: 'P'|'F'|'T'}} - tests missing from a result were not run."""
     import select
     pending = list(jobs)
+    if not os.environ.get("BR_NO_FREEZE"):
+        gc.freeze()     # what this process built since warming up is not the children's garbage
     active = []
     out = {}
     while pending or active:

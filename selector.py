@@ -26,6 +26,15 @@ TIME_BUDGET = float(os.environ.get("BR_TIME_BUDGET", "140"))   # seconds of wall
 MAX_WORKERS = 8
 # tests that need a fresh interpreter with the patched tree: never verified here
 NO_VERIFY = {"tests/dialects/test_dialect.py::TestDialect::test_lazy_load"}
+# the files `import sqlglot` loads in a new interpreter (at the pinned commit)
+LAZY_CLOSURE = {"sqlglot/" + x for x in (
+    "__init__.py _typing.py dialects/__init__.py dialects/dialect.py diff.py errors.py expressions/__init__.py "
+    "expressions/aggregate.py expressions/array.py expressions/builders.py expressions/constraints.py "
+    "expressions/core.py expressions/datatypes.py expressions/ddl.py expressions/dml.py expressions/functions.py "
+    "expressions/json.py expressions/math.py expressions/properties.py expressions/query.py expressions/string.py "
+    "expressions/temporal.py generator.py helper.py jsonpath.py optimizer/__init__.py optimizer/scope.py parser.py "
+    "parsers/__init__.py parsers/base.py schema.py time.py tokenizer_core.py tokens.py trie.py typing/__init__.py "
+    "_version.py").split()}
 CHILD_OVERHEAD = 0.03   # fork + patch + exit, swap mode
 REIMPORT_OVERHEAD = 0.6  # extra when module- or class-level code changed
 WARM_COST = 0.7
@@ -544,11 +553,13 @@ def narrow_by_data(plans, reach, answers, tests, map_nums, unmapped, ms, run_cos
     except Exception:
         keymap = None
     nw = narrow.Narrower(ctx["mp"], narrow.Source(ROOT), keymap)
+    lazy_num = ctx["num_by_id"].get("tests/dialects/test_dialect.py::TestDialect::test_lazy_load")
     for cid in todo:
         entries = diffs.get(cid)
         if entries is None:
             log("%s data diff: none" % cid)
             continue
+        nw.touched = {rel for rel, _t, _c in reach[cid][0].py}
         bits = nw.compute(entries)
         if bits is None:
             log("%s data diff: %d entries, no narrowing" % (cid, len(entries)))
@@ -562,6 +573,11 @@ def narrow_by_data(plans, reach, answers, tests, map_nums, unmapped, ms, run_cos
             bits >>= 1
             i += 1
         new = cand & keep
+        if lazy_num in new and not os.environ.get("BR_NO_OWN") and not r.data and \
+                all(rel.startswith("sqlglot/") and rel not in LAZY_CLOSURE for rel, _t, _c in r.py):
+            # test_lazy_load only runs `import sqlglot` in a new interpreter, which loads
+            # none of the changed files (and they do import: the data diff just did)
+            new.discard(lazy_num)
         cbits, classes = nw.by_class
         if cbits and classes:
             ctx.setdefault("by_class", {})[cid] = (cbits, classes)
