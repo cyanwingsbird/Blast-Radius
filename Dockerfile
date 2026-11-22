@@ -30,6 +30,6 @@ RUN cd /app && python -c "import runner; runner.save_duck_cache()" ; chmod a+r /
 RUN cd /app && python -c "import runner; runner.save_refs()" ; chmod a+r /app/refs.pickle || true
 RUN cd /app && python -c "import narrow; narrow.Source('/opt/sqlglot').save_index(narrow.INDEX_FILE)" ; chmod a+r /app/narrow.idx || true
 
-ENV BR_MASS_N=1
+ENV BR_MASS_N=2
 WORKDIR /app
 CMD ["python", "/app/selector.py"]
