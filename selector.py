@@ -157,6 +157,13 @@ def main():
         if not cand:
             answers[cid] = []
             continue
+        if r.data and len(cand) <= FIX_BLIND and r.runnable and not r.everything and \
+                all(_real_fixture_edit(p, t) for p, t in r.data) and _same_code(r):
+            # an edited fixture line and the one test that reads it: such an edit all but
+            # always breaks that test, so running it first costs more than it can save
+            answers[cid] = sorted(cand)
+            REACH[cid] = r
+            continue
         reimport = any(c is None for _p, _t, c in r.py) or _needs_reimport(r)
         # (an edited fixture changes the queries, so recorded duckdb results do not apply either)
         exec_setup = (r.data and not _sql_only(r.data)) or \
@@ -606,6 +613,7 @@ def _calibrate():
     log("calibration cpu %.2f" % (time.process_time() - t))
 
 
+FIX_BLIND = int(os.environ.get("BR_FIX_BLIND", "1"))   # most tests a fixture-only change may leave unverified
 DIFF_MIN = 0.8        # candidate CPU above which a data diff is worth its re-import
 DIFF_BUDGET = 25.0    # seconds from the start
 
@@ -902,6 +910,47 @@ def case_filter(tid, num, r, ctx):
 FIXTURE_PREFIX = "tests/fixtures/"
 TPCH_FIXTURE = "tests/fixtures/optimizer/tpc-h/tpc-h.sql"
 TPCDS_FIXTURE = "tests/fixtures/optimizer/tpc-ds/tpc-ds.sql"
+
+
+def _fixture_content(text):
+    # the lines the loaders hand to a test, without spacing and letter case
+    return ["".join(line.split()).lower() for line in text.splitlines()
+            if line.strip() and not line.lstrip().startswith(("#", "--"))]
+
+
+def _real_fixture_edit(path, text):
+    """An edit to a SQL fixture that changes a statement itself, not only its
+    spacing, letter case, comments or settings lines."""
+    if not path.startswith(FIXTURE_PREFIX) or not path.endswith(".sql"):
+        return False
+    try:
+        with open(os.path.join(ROOT, path), encoding="utf-8") as f:
+            old_text = f.read()
+    except (OSError, UnicodeDecodeError):
+        return False
+    return _fixture_content(old_text) != _fixture_content(text)
+
+
+def _same_code(r):
+    """The patch leaves every Python file compiling to what it compiled to before
+    (comments and blank lines only)."""
+    if not r.py:
+        return True
+    if r.lines or r.classes or r.new_files or r.coarse or _needs_reimport(r):
+        return False
+    try:
+        import analyze
+        import runner
+        for rel, _text, new_code in r.py:
+            if new_code is None:
+                return False
+            with open(os.path.join(ROOT, rel), encoding="utf-8") as f:
+                old_code = analyze.load_old_code(ROOT, rel, f.read())
+            if runner.plan_swaps(old_code, new_code, analyze._sig) != []:
+                return False
+    except Exception:
+        return False
+    return True
 
 
 def _filter_comments(s):
