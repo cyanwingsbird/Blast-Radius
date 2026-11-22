@@ -67,6 +67,8 @@ def best_split(ms_by_test):
 
 
 FAILED = {}
+REACH = {}
+HEAVY_NUMS = {}
 
 
 def main():
@@ -99,6 +101,7 @@ def main():
     for t in tests:
         if t["id"] in HEAVY:
             heavy[t["number"]] = HEAVY[t["id"]]
+            HEAVY_NUMS[t["number"]] = HEAVY[t["id"]]
     ctx = {"mp": mp, "probes": probes, "heavy": heavy, "map_index": {i: n for n, i in enumerate(mp.ids)},
            "casemap": None, "casemap_path": os.path.join(HERE, "casemap.bin"),
            "callmap": None, "callmap_path": os.path.join(HERE, "callmap.bin"), "num_by_id": num_by_id}
@@ -142,6 +145,7 @@ def main():
         plans[cid] = plan(cid, cand, r, ms, run_cost_reimport if exec_setup else run_cost, setup_cost,
                           by_num, reimport, ctx)
         reach[cid] = (r, cand, reimport)
+        REACH[cid] = r
 
     warm = None
     try:
@@ -227,6 +231,26 @@ def _diagnose(all_bins, ms, commits, plans):
     import resource
     me = resource.getrusage(resource.RUSAGE_SELF)
     ch = resource.getrusage(resource.RUSAGE_CHILDREN)
+    if os.environ.get("BR_DIAG") == "3":
+        # where the blind seconds come from: commits that cannot be verified at all,
+        # and commits whose slowest test is kept unverified
+        tpcds = {n for n, k in HEAVY_NUMS.items() if k == "tpcds"}
+        sec_nv = 0
+        n_nv = 0
+        n_tp = 0
+        for cid in commits:
+            bins = all_bins[cid]
+            c = (max(sum(ms[n] for n in b) for b in bins) + 2000 * len(bins)) if bins else 0
+            r = REACH.get(cid)
+            if r is not None and (r.everything or not r.runnable):
+                sec_nv += c
+                n_nv += 1
+            kept = {n for b in bins for n in b}
+            if kept & tpcds and not set(FAILED.get(cid, [])) & tpcds:
+                n_tp += 1
+        log("diag3: nonverifiable %d commits %d ms, tpcds kept unverified %d" % (n_nv, sec_nv, n_tp))
+        _encode(all_bins, ms, commits, int(round(sec_nv / 1000.0)), min(1999, 100 * n_nv + n_tp))
+        return
     if os.environ.get("BR_DIAG") == "2":
         # what blind scheduling costs: the simulated ms above keeping only the tests seen failing
         waste = 0
@@ -634,7 +658,7 @@ def plan(cid, cand, r, ms, run_cost, setup_cost, by_num, reimport, ctx):
         else:
             blind.append(n)
     run_cost = dict(run_cost)
-    alpha = float(os.environ.get("BR_ALPHA", "1.25"))
+    alpha = float(os.environ.get("BR_ALPHA", "2.0"))
     if alpha != 1.0:
         run_cost = {k: v * alpha for k, v in run_cost.items()}
     spec = {}
