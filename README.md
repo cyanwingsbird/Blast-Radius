@@ -21,10 +21,11 @@ Picks the sqlglot tests a patch can break, and splits them across workers.
      those, every test that loads the module is in reach.
    - An edit to a SQL fixture, in a patch whose Python files compile unchanged,
      is not verified when exactly one test reads that fixture and an edited
-     statement no longer parses or parses to another tree: such an edit all but
-     always breaks that test, so the test is scheduled as it is. An edit that
-     parses to the same tree (a dropped optional keyword, spacing) is verified
-     like any other.
+     statement of a (statement, expected) pair no longer parses or parses to
+     another tree: such an edit all but always breaks that test, so the test is
+     scheduled as it is. Edits that parse to the same tree (a dropped optional
+     keyword, spacing), edits after the last complete pair (which no test
+     looks at) and fixtures read line by line are verified like any other.
 2. **Verification** (`runner.py`). Candidate tests are run in the container
    against the patched code. The pinned sqlglot and its tests are imported
    once, and each commit gets a forked child. The child swaps in the changed
@@ -151,6 +152,9 @@ relations, probes and costs all come from running the pinned commit's own
 tests.
 
 ## Building the data files
+
+`tools/lazymap.py` repacks `callmap.bin` and `casemap.bin` with one record per
+test, so the selector unpacks only the records of the tests a patch can reach.
 
 `tools/` holds the scripts that built them from a checkout of the pinned
 commit:

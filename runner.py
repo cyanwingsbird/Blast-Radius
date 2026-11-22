@@ -861,7 +861,7 @@ def _limit_duckdb_threads():
 class Warm:
     """State prepared once in the parent."""
 
-    def __init__(self, test_files, need_refs=False):
+    def __init__(self, test_files, need_refs=False, exec_cache=True):
         os.environ.setdefault("SKIP_INTEGRATION", "0")
         if ROOT not in sys.path:
             sys.path.insert(0, ROOT)
@@ -892,12 +892,9 @@ class Warm:
             pass
         install_sync_pools()
         self.exec_cache = None
-        if "tests/test_executor.py" in test_files:
-            try:
-                self.exec_cache = _load_exec_cache() or _build_exec_cache()
-                _load_duck_cache()
-            except Exception:
-                self.exec_cache = None
+        self.exec_loaded = False
+        if exec_cache and "tests/test_executor.py" in test_files:
+            self.load_exec()
         self.refs = None
         if need_refs:
             # every sqlglot module, so that a data diff never meets one it has no pinned copy of
@@ -928,6 +925,18 @@ class Warm:
                 if c.co_filename.startswith(ROOT):
                     self.funcs.setdefault(_ckey(c), []).append(o)
         gc.freeze()
+
+    def load_exec(self):
+        """The executor tests' tables and recorded duckdb answers (20 MB to unpickle:
+        only when one of those tests will run)."""
+        if self.exec_loaded or "tests.test_executor" not in sys.modules:
+            return
+        self.exec_loaded = True
+        try:
+            self.exec_cache = _load_exec_cache() or _build_exec_cache()
+            _load_duck_cache()
+        except Exception:
+            self.exec_cache = None
 
     def apply(self, py, data, sig, load_old, use_cache=True):
         """In the child: make the patched sources live.  py: [(rel, text, new_code)]."""

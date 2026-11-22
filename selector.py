@@ -132,6 +132,7 @@ def main():
     plans = {}
     reach = {}
     fix_cand = {}
+    later = []
     for cid in commits:
         text = open(os.path.join(DATA, "commits", cid + ".patch"), encoding="utf-8", errors="replace").read()
         try:
@@ -166,9 +167,12 @@ def main():
         exec_setup = (r.data and not _sql_only(r.data)) or \
             any(p.startswith(("sqlglot/executor/", "tests/", "sqlglot/helper")) for p, _t, _c in r.py)
         costs_here = run_cost_reimport if exec_setup else run_cost
-        plans[cid] = plan(cid, cand, r, ms, costs_here, setup_cost, by_num, reimport, ctx)
         reach[cid] = (r, cand, reimport, costs_here)
         REACH[cid] = r
+        if _diffable(r, cand, reimport, run_cost) and not os.environ.get("BR_EAGER_PLAN"):
+            later.append(cid)      # (planned after the data diff, most likely for far fewer tests)
+        else:
+            plans[cid] = plan(cid, cand, r, ms, costs_here, setup_cost, by_num, reimport, ctx)
 
     warm = None
     try:
@@ -176,6 +180,10 @@ def main():
                               by_num, ctx, t_start)
     except Exception as e:  # the static plans stand
         log("data diff failed: %r" % (e,))
+    for cid in later:
+        if cid not in plans and cid not in answers:      # no narrowing: every candidate
+            r, cand, reimport, costs_here = reach[cid]
+            plans[cid] = plan(cid, cand, r, ms, costs_here, setup_cost, by_num, reimport, ctx)
 
     # an edited fixture statement and the one test that reads it: when the statement no
     # longer parses, or parses to something else, the test all but always fails, and
@@ -204,6 +212,8 @@ def main():
         need_refs = any(p.get("reimport") for _c, p in jobs)
         if warm is None or (need_refs and warm.refs is None):
             warm = runner.Warm({by_num[n]["file"] for _c, p in jobs for n, _ in p["order"]}, need_refs=need_refs)
+        if any(by_num[n]["file"] == "tests/test_executor.py" for _c, p in jobs for n, _ in p["order"]):
+            warm.load_exec()
         log("warm cpu %.2f, analysis cpu %.2f" % (time.process_time() - t_w, t_w))
         jobs.sort(key=lambda j: -j[1]["est"])
         results = runner.run_jobs(warm, [(cid, {"py": p["py"], "data": p["data"], "order": p["order"],
@@ -627,24 +637,25 @@ DIFF_MIN = 0.8        # candidate CPU above which a data diff is worth its re-im
 DIFF_BUDGET = 25.0    # seconds from the start
 
 
+def _diffable(r, cand, reimport, run_cost):
+    """Whether a data diff is tried for this commit."""
+    if not reimport or not r.py or not r.runnable:
+        return False
+    # (a changed source file that a test also reads as text is fine: that test is kept)
+    if r.data and (os.environ.get("BR_NO_SRCDATA") or
+                   not {p for p, _t in r.data} <= {p for p, _t, _c in r.py}):
+        return False
+    if any(p.startswith("tests/") for p, _t, _c in r.py):
+        return False
+    return sum(run_cost[n] for n in cand) >= DIFF_MIN
+
+
 def narrow_by_data(plans, reach, answers, tests, map_nums, unmapped, ms, run_cost, setup_cost, by_num, ctx,
                    t_start):
     """For changes to data built at import (class and module bodies): re-import the
     patched modules in a child, see which values changed, and keep only the tests
     that can see those values.  Returns the warm parent state, or None."""
-    todo = []
-    for cid, (r, cand, reimport, _rc) in reach.items():
-        if not reimport or not r.py or not r.runnable:
-            continue
-        # (a changed source file that a test also reads as text is fine: that test is kept below)
-        if r.data and (os.environ.get("BR_NO_SRCDATA") or
-                       not {p for p, _t in r.data} <= {p for p, _t, _c in r.py}):
-            continue
-        if any(p.startswith("tests/") for p, _t, _c in r.py):
-            continue
-        if sum(run_cost[n] for n in cand) < DIFF_MIN:
-            continue
-        todo.append(cid)
+    todo = [cid for cid, (r, cand, reimport, _rc) in reach.items() if _diffable(r, cand, reimport, run_cost)]
     if os.environ.get("BR_PROF"):
         log("data diff candidates: %d of %d" % (len(todo), len(reach)))
     if not todo:
@@ -652,7 +663,8 @@ def narrow_by_data(plans, reach, answers, tests, map_nums, unmapped, ms, run_cos
     import runner
     import narrow
     t_w = time.process_time()
-    warm = runner.Warm({t["file"] for t in tests}, need_refs=True)
+    # (the executor tables are loaded later, if a job turns out to need them)
+    warm = runner.Warm({t["file"] for t in tests}, need_refs=True, exec_cache=False)
     if os.environ.get("BR_PROF"):
         log("prof: warm done parent %.2f (before warm %.2f)" % (time.process_time(), t_w))
     diffs = runner.run_diffs(warm, [(cid, reach[cid][0].py) for cid in todo], parallel=2,
@@ -856,14 +868,45 @@ def _small_probe(r, ctx, hbit, pr):
     return pid, est, 0.0
 
 
+class _PerTest:
+    """A map whose records are packed one per test and unpacked when first asked for."""
+
+    def __init__(self, packed):
+        self.packed = packed
+        self.done = {}
+
+    def get(self, tid, default=None):
+        if tid in self.done:
+            return self.done[tid]
+        blob = self.packed.get(tid)
+        if blob is None:
+            return default
+        import pickle
+        import zlib
+        v = self.done[tid] = pickle.loads(zlib.decompress(blob))
+        return v
+
+
+def _load_map(path):
+    """callmap.bin / casemap.bin: packed per test (tools/lazymap.py), or whole."""
+    import pickle
+    import zlib
+    with open(path, "rb") as f:
+        data = f.read()
+    if data.startswith(b"LZ1"):
+        m = pickle.loads(data[3:])
+        m["tests"] = _PerTest(m["tests"])
+        return m
+    return pickle.loads(zlib.decompress(data))
+
+
 def case_filter(tid, num, r, ctx):
     """For a fixture-driven test: the fixture items that can reach the change,
     and the CPU to run only those.  None when the whole test has to run."""
     import pickle
     import zlib
     if ctx["casemap"] is None:
-        with open(ctx["casemap_path"], "rb") as f:
-            ctx["casemap"] = pickle.loads(zlib.decompress(f.read()))
+        ctx["casemap"] = _load_map(ctx["casemap_path"])
     cm = ctx["casemap"]["tests"].get(tid)
     if cm is None:
         return None
@@ -941,9 +984,13 @@ def _real_fixture_edit(path, text):
 
 
 def _breaks_statement(path, text):
-    """True when an edited statement of this SQL fixture stopped parsing or parses to
-    another tree (so not: a dropped optional keyword, spacing, a statement that did
-    not parse in the default dialect to begin with)."""
+    """True when the edit changes a statement that a test of this SQL fixture checks, so
+    that it no longer parses or parses to another tree.  Only for the fixtures read as
+    (statement, expected) pairs: what follows the last complete pair is never looked at,
+    and a dropped optional keyword or changed spacing parses to the same tree."""
+    if path != "tests/fixtures/pretty.sql" and not (
+            path.startswith("tests/fixtures/optimizer/") and path != "tests/fixtures/optimizer/qualify_columns__invalid.sql"):
+        return False
     if ROOT not in sys.path:
         sys.path.insert(0, ROOT)
     import sqlglot
@@ -956,32 +1003,28 @@ def _breaks_statement(path, text):
             return None
         return sqlglot.parse_one(sql)
 
-    for split in (lambda s: _filter_comments(s).split(";"), lambda s: _filter_comments(s).splitlines()):
-        olds, news = split(old_text), split(text)
-        if len(olds) != len(news):
-            continue
-        pairs = [(o, n) for o, n in zip(olds, news) if o != n]
-        if not pairs:
-            continue
-        verdicts = []
-        for o, n in pairs:
+    olds, news = _fixture_pairs(old_text), _fixture_pairs(text)
+    if len(olds) != len(news):
+        return False
+    broken = False
+    for old_pair, new_pair in zip(olds, news):
+        for o, n in zip(old_pair, new_pair):
+            if o == n:
+                continue
             try:
                 a = tree(o)
             except Exception:
-                verdicts = None
-                break
+                return False       # (not default-dialect SQL: no telling what the edit does)
             if a is None:
-                verdicts = None
-                break
+                return False
             try:
                 b = tree(n)
             except Exception:
-                verdicts.append(True)
+                broken = True
                 continue
-            verdicts.append(a != b)
-        if verdicts is not None:
-            return any(verdicts)
-    return False
+            if b is None or a != b:
+                broken = True
+    return broken
 
 
 def _same_code(r):
@@ -1036,8 +1079,8 @@ def call_filter(tid, num, r, ctx):
     import pickle
     import zlib
     if ctx["callmap"] is None:
-        with open(ctx["callmap_path"], "rb") as f:
-            ctx["callmap"] = pickle.loads(zlib.decompress(f.read()))
+        m = _load_map(ctx["callmap_path"])
+        ctx["callmap"] = m["tests"] if isinstance(m.get("tests"), _PerTest) else m
     cm = ctx["callmap"].get(tid)
     if cm is None:
         return None
@@ -1070,8 +1113,7 @@ def call_filter(tid, num, r, ctx):
             return None            # no record of which classes most calls use
         common = set(common)
         if ctx["casemap"] is None:
-            with open(ctx["casemap_path"], "rb") as f:
-                ctx["casemap"] = pickle.loads(zlib.decompress(f.read()))
+            ctx["casemap"] = _load_map(ctx["casemap_path"])
         fam = ctx["casemap"]["family"]
         for key in r.classes:
             if not (mp.cls_bits.get(key, 0) & tbit):
