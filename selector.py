@@ -312,6 +312,21 @@ def _diagnose(all_bins, ms, commits, plans):
     import resource
     me = resource.getrusage(resource.RUSAGE_SELF)
     ch = resource.getrusage(resource.RUSAGE_CHILDREN)
+    if os.environ.get("BR_DIAG") == "12":
+        # kernel time (page faults, forks): the children's in tenths, this process's in 1/200
+        k = min(140, int(round(ch.ru_stime / 0.1)))
+        m = min(1999, int(round(me.ru_stime / 0.005)))
+        log("diag12: sys self %.2f children %.2f; minflt self %d children %d" %
+            (me.ru_stime, ch.ru_stime, me.ru_minflt, ch.ru_minflt))
+        _encode(all_bins, ms, commits, k, m)
+        return
+    if os.environ.get("BR_DIAG") == "13":
+        # minor page faults: the children's in 20 thousands, this process's in hundreds
+        k = min(140, int(round(ch.ru_minflt / 20000.0)))
+        m = min(1999, int(round(me.ru_minflt / 100.0)))
+        log("diag13: minflt self %d children %d" % (me.ru_minflt, ch.ru_minflt))
+        _encode(all_bins, ms, commits, k, m)
+        return
     if os.environ.get("BR_DIAG") == "11":
         # how many jobs run tests that use pandas (it is a quarter of the warm-up)
         tests = json.load(open(os.path.join(DATA, "tests.json")))["tests"]
