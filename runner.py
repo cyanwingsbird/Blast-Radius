@@ -428,6 +428,10 @@ def _blind_cost(loads_ms, n, total):
     return min(max(mx, -(-total // k)) + 2000 * k for k in range(1, min(8, n) + 1))
 
 
+MASS_N = int(os.environ.get("BR_MASS_N", "3"))
+MASS_F = float(os.environ.get("BR_MASS_F", "0.5"))
+
+
 def run_tests(order, out_fd, mass_stop=True, dyn=None):
     """order: list of (num, test_id).  Writes 'num status secs' lines to out_fd.
     Classes are set up once each and torn down at the end of their run."""
@@ -453,7 +457,7 @@ def run_tests(order, out_fd, mass_stop=True, dyn=None):
                 kept.append(t_ms)
                 w.write("%d S 0\n" % num)
                 continue
-        if mass_stop and n_bad >= 3 and 2 * n_bad >= n_done and not is_probe:
+        if mass_stop and n_bad >= MASS_N and n_bad >= MASS_F * n_done and not is_probe:
             w.write("%d S 0\n" % num)
             continue      # a mass breakage: leave the rest scheduled, but still run the probes
         t0 = time.process_time()

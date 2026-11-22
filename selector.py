@@ -191,6 +191,8 @@ def main():
                 for n, tid in p["order"]:
                     kind = tid[0] if isinstance(tid, tuple) else ("PROBE" if tid.startswith("PROBE:") else "FULL")
                     dbg.write("%s\t%d\t%s\t%s\n" % (cid, n, kind, res.get(n, "-")))
+                for n in p["blind"]:
+                    dbg.write("%s\t%d\tBLIND\tB\n" % (cid, n))
     for cid, p in jobs:
         res = results.get(cid, {})
         keep = set(p["blind"])

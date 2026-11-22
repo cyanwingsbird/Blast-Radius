@@ -183,6 +183,18 @@ class Map:
         self.cls_bits = meta.get("cls_bits", {})
         self.import_used = set(meta.get("import_used", ()))
         self._cache = {}
+        self.cmpfile = os.path.join(os.path.dirname(os.path.abspath(mapfile)), "cmpmap.bin")
+        self._cmp = None
+
+    def cmp_sites(self, path):
+        """{(line, col): (operator, {pair class: tests}, pair classes seen while importing)} for a file."""
+        if self._cmp is None:
+            try:
+                with open(self.cmpfile, "rb") as f:
+                    self._cmp = pickle.loads(zlib.decompress(f.read()))
+            except Exception:
+                self._cmp = {"sites": {}, "unrecorded": 0}
+        return self._cmp["sites"].get(path), self._cmp["unrecorded"]
 
     def file(self, path):
         """(lines: {line: (def_bits, call_bits)}, any_bits) or None."""
@@ -317,6 +329,108 @@ def _span(stmt, line):
         return range(stmt.lineno, end + 1), False
     doc = isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant) and isinstance(stmt.value.value, str)
     return range(stmt.lineno, end + 1), doc
+
+
+# ------------------------------------------------- comparison operator swaps
+
+_CMP_OPS = [ast.Is, ast.IsNot, ast.Eq, ast.NotEq, ast.Lt, ast.LtE, ast.Gt, ast.GtE]
+_CMP_TOKEN = re.compile(r"\bis\s+not\b|\bis\b|==|!=|<=|>=|<|>")
+_EQO, _EQU, _LT, _GT, _NEO, _NEU, _ERR = 0, 1, 2, 3, 4, 5, 7
+
+
+def _cmp_truth(op, cls):
+    """What operator `op` answers for a recorded pair class; None when it raises or is unknown."""
+    ident, rel = cls >> 3, cls & 7
+    if rel == _ERR:
+        return None
+    if op == 0:
+        return bool(ident)
+    if op == 1:
+        return not ident
+    if op == 2:
+        return rel in (_EQO, _EQU)
+    if op == 3:
+        return rel not in (_EQO, _EQU)
+    if rel in (_EQU, _NEU):
+        return None
+    if op == 4:
+        return rel == _LT
+    if op == 5:
+        return rel in (_LT, _EQO)
+    if op == 6:
+        return rel == _GT
+    return rel in (_GT, _EQO)
+
+
+def _cmp_swaps(old_text, new_text):
+    """[(line, col, old operator, new operator)] when the sources differ only in the
+    operator of one-operator comparisons; None otherwise."""
+    if _CMP_TOKEN.sub("?", old_text) != _CMP_TOKEN.sub("?", new_text):
+        # (comment-only lines added next to the swap are tolerated below)
+        strip = lambda t: "\n".join(l for l in _CMP_TOKEN.sub("?", t).split("\n") if not l.lstrip().startswith("#"))
+        if strip(old_text) != strip(new_text):
+            return None
+    try:
+        a, b = ast.parse(old_text), ast.parse(new_text)
+    except Exception:
+        return None
+    out = []
+    stack = [(a, b)]
+    while stack:
+        x, y = stack.pop()
+        if type(x) is not type(y):
+            return None
+        if isinstance(x, ast.Compare) and len(x.ops) == 1 and len(y.ops) == 1 and type(x.ops[0]) is not type(y.ops[0]):
+            if type(x.ops[0]) not in _CMP_OPS or type(y.ops[0]) not in _CMP_OPS:
+                return None
+            out.append((x.lineno, x.col_offset, _CMP_OPS.index(type(x.ops[0])), _CMP_OPS.index(type(y.ops[0]))))
+            stack.append((x.left, y.left))
+            stack.append((x.comparators[0], y.comparators[0]))
+            continue
+        for name in x._fields:
+            u, v = getattr(x, name, None), getattr(y, name, None)
+            if isinstance(u, ast.AST):
+                if not isinstance(v, ast.AST):
+                    return None
+                stack.append((u, v))
+            elif isinstance(u, list):
+                if not isinstance(v, list) or len(u) != len(v):
+                    return None
+                for i, j in zip(u, v):
+                    if isinstance(i, ast.AST):
+                        if not isinstance(j, ast.AST):
+                            return None
+                        stack.append((i, j))
+                    elif i != j or type(i) is not type(j):
+                        return None
+            elif u != v or type(u) is not type(v):
+                return None
+    return out or None
+
+
+def cmp_infected(mp, path, old_text, new_text):
+    """Tests whose run can differ when the patch only swaps comparison operators:
+    those that compared a pair the old and the new operator answer differently for.
+    None when the patch is something else or a site has no record."""
+    swaps = _cmp_swaps(old_text, new_text)
+    if not swaps:
+        return None
+    sites, bits = mp.cmp_sites(path)
+    if not sites:
+        return None
+    for line, col, old_op, new_op in swaps:
+        site = sites.get((line, col))
+        if site is None or site[0] != old_op:
+            return None
+        for cls in site[2]:
+            a, b = _cmp_truth(old_op, cls), _cmp_truth(new_op, cls)
+            if a is None or b is None or a != b:
+                return None          # differs while modules import: every test sees it
+        for cls, tests in site[1].items():
+            a, b = _cmp_truth(old_op, cls), _cmp_truth(new_op, cls)
+            if a is None or b is None or a != b:
+                bits |= tests
+    return bits
 
 
 # ---------------------------------------------------------------- analysis
@@ -539,9 +653,20 @@ def _one(fp, path, root, mp, r):
         return
     r.bits |= opens
     src_lines = old_text.split("\n")
+    infected = None
+    if all(c.co_flags & 1 for c in changed) and not os.environ.get("BR_NO_CMP"):
+        try:
+            infected = cmp_infected(mp, path, old_text, new_text)
+        except Exception:
+            infected = None
     for c in changed:
         if c.co_flags & 1:                               # function body
             bits, how = _func_candidates(c, src_lines, changes, cov, r.lines.setdefault(path, set()))
+            if infected is not None:
+                # only a comparison operator changed: a test that never compared a pair the
+                # two operators disagree on runs exactly as before
+                bits &= infected
+                how += "+cmp"
             r.add(bits, "%s %s:%s" % (how, path, c.co_qualname))
         else:                                            # module or class body
             own = sorted(own_lines(c))

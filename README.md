@@ -78,7 +78,18 @@ Picks the sqlglot tests a patch can break, and splits them across workers.
    anything cannot be compared, the static reach stands.
    For changed dict entries keyed by a class, tests kept only for using that
    class run only the fixture items or `validate_*` calls that use it.
-4. **Cost model** (`selector.py`). Per commit, verify the candidates whose CPU
+4. **Comparison operators** (`analyze.py`, `cmpmap.bin`). When a patch only
+   swaps the operator of comparisons inside functions (`is` for `==`, `<` for
+   `<=`, ...), a test can only notice if it compares a pair of values that the
+   old and the new operator answer differently for. `cmpmap.bin` records, per
+   test and per comparison in sqlglot, which kinds of pairs were compared:
+   identical or not, and equal, less, greater, unequal or unordered. The
+   candidates are cut to the tests that saw a pair the two operators disagree
+   on. Pairs whose comparison could run sqlglot code (two expressions of the
+   same class, for example) count as disagreeing, and so does any pair compared
+   while modules import. A swap such as `x is None` to `x == None` that no test
+   can tell apart costs nothing.
+5. **Cost model** (`selector.py`). Per commit, verify the candidates whose CPU
    (`costs.json`) is less than what scheduling them blind would cost. After a
    failure, verification carries on unless at least half of what has run
    failed. Everything kept is packed longest-first onto however many workers
@@ -115,6 +126,7 @@ commit:
 | `probes.bin` | `tpcds_cov.py`, `probecal.py`, `probe_check.py`, `buildprobes.py` |
 | `costs.json` | `measure.py` |
 | `keymap.bin` | `keyrec.py` with `brrec.py` (records the keys each test looks up, on an instrumented copy whose lines do not move) |
+| `cmpmap.bin` | `cmprec.py` with `cmprt.py` (records the kinds of operand pairs each comparison sees, on an instrumented copy); `cmpcheck.py` runs the tests the narrowing drops on random operator swaps |
 | `narrow.idx` (in the image) | built by `narrow.py` during the image build |
 | `execcache.pickle`, `duckcache.pickle`, `refs.pickle` (in the image) | built by `runner.py` during the image build: executor tables, duckdb results of the pinned queries, module reference map |
 
