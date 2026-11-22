@@ -245,6 +245,42 @@ def _diagnose(all_bins, ms, commits, plans):
     import resource
     me = resource.getrusage(resource.RUSAGE_SELF)
     ch = resource.getrusage(resource.RUSAGE_CHILDREN)
+    if os.environ.get("BR_DIAG") == "8":
+        # the CPU split: this process (analysis, warm-up, data diffs' parent side) in tenths,
+        # the verification children in fiftieths
+        import runner
+        kids = sum(runner.CHILD_CPU.values())
+        mine = me.ru_utime + me.ru_stime
+        k = min(140, int(round(mine / 0.1)))
+        m = min(1999, int(round(kids / 0.02)))
+        log("diag8: self %.2f children(verify) %.2f all children %.2f" % (mine, kids, ch.ru_utime + ch.ru_stime))
+        _encode(all_bins, ms, commits, k, m)
+        return
+    if os.environ.get("BR_DIAG") == "7":
+        # where the CPU goes: the rank-th costliest commit's CPU, file and kind
+        import runner
+        rows = sorted(((c, cid) for cid, c in runner.CHILD_CPU.items()), reverse=True)
+        rank = int(os.environ.get("BR_DIAG_ARG", "0"))
+        k, m = 0, 1999
+        if rank < len(rows):
+            c, cid = rows[rank]
+            r = REACH.get(cid)
+            p = plans.get(cid, {})
+            files = _source_files()
+            fi = 199
+            if r is not None and r.py:
+                path = sorted(x for x, _t, _c in r.py)[0]
+                fi = files.index(path) if path in files else 198
+            elif r is not None and r.data:
+                fi = 197
+            flags = (1 if p.get("reimport") else 0) | \
+                (2 if any(isinstance(t, str) and t.startswith("PROBE:") for _n, t in p.get("order", ())) else 0) | \
+                (4 if FAILED.get(cid) else 0)
+            k = min(140, int(round(c / 0.1)))
+            m = fi * 10 + flags
+            log("diag7: rank %d %s cpu %.2f file %d flags %d" % (rank, cid, c, fi, flags))
+        _encode(all_bins, ms, commits, k, m)
+        return
     if os.environ.get("BR_DIAG") == "6":
         # what the tests kept without a verdict really cost: run them all (diagnostic
         # only) and compare with keeping just the ones that fail
