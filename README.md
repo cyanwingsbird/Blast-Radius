@@ -98,6 +98,10 @@ Picks the sqlglot tests a patch can break, and splits them across workers.
    a new child, as do those a killed child had not started. On 11 local sets
    of mutants this gave the same answers as one child per commit
    (`BR_BATCH=1`).
+   Kinds of change checked against a full pytest run of the patched tree, with
+   no failing test missed: a deleted source file, a syntax error, an edited
+   test helper, edited test code, a changed default argument, a changed
+   package `__init__`.
    `BR_LAZY_PANDAS=1` imports pandas only when a job is known to need it; on
    the board more than one job needed it after all, so it is off.
    `tests/test_sqlglotc.py` is not imported up front: it loads no sqlglot
