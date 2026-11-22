@@ -248,10 +248,13 @@ def main():
             group = [(cid, p) for cid, p in jobs if uses_tables(p) == 0 and not p.get("reimport") and
                      not any(rel.startswith("tests/") for rel, _t, _c in p["py"])]
             if len(group) > 1:
-                batched = {cid for cid, _p in group}
                 packs = [[(cid, as_job(p)) for cid, p in group[i:i + BATCH]] for i in range(0, len(group), BATCH)]
-                results.update(runner.run_batches(warm, packs, parallel=PARALLEL, log=log,
-                                                  deadline=t_start + TIME_BUDGET))
+                try:
+                    results.update(runner.run_batches(warm, packs, parallel=PARALLEL, log=log,
+                                                      deadline=t_start + TIME_BUDGET))
+                    batched = {cid for cid, _p in group}
+                except Exception as e:      # those commits get a child each below
+                    log("batch run failed: %r" % (e,))
         for want in (0, 1, 2):
             part = [(cid, p) for cid, p in jobs if uses_tables(p) == want and cid not in batched]
             if not part:
@@ -733,7 +736,7 @@ FIX_BLIND = int(os.environ.get("BR_FIX_BLIND", "0"))   # most tests a fixture-on
 LATE_FILES = {"tests/test_sqlglotc.py"}
 # children at a time: one, since CPU seconds are what counts and two at once cost more of them
 PARALLEL = int(os.environ.get("BR_PAR", "1"))
-BATCH = int(os.environ.get("BR_BATCH", "1"))      # commits per child, for those that only swap function bodies
+BATCH = int(os.environ.get("BR_BATCH", "99"))     # commits per child, for those that only swap function bodies
 LAZY_PANDAS = int(os.environ.get("BR_LAZY_PANDAS", "0"))    # 2: not for filtered optimizer tests
 # the TestOptimizer tests that hand duckdb's answers to pandas (found by running each
 # one with the stand-in module in place)

@@ -88,6 +88,18 @@ Picks the sqlglot tests a patch can break, and splits them across workers.
      the TPC-DS fixture probes exactly the queries that changed.
    One child runs at a time: only CPU seconds count, and on the board two at
    once used more of them.
+   Commits that only swap function bodies or overlay a data file (nothing to
+   re-import, no test code, no executor tables) share one child: the bodies
+   are swapped back and the overlay is lifted after each commit. So is what a
+   commit's tests may leave behind: names rebound in the `sqlglot` package (the
+   optimizer tests replace the default schema), the decimal context, a fixture
+   or call filter. When a commit changes interpreter settings or loads a
+   sqlglot module, or needs a re-import after all, the commits after it go to
+   a new child, as do those a killed child had not started. On 11 local sets
+   of mutants this gave the same answers as one child per commit
+   (`BR_BATCH=1`).
+   `BR_LAZY_PANDAS=1` imports pandas only when a job is known to need it; on
+   the board more than one job needed it after all, so it is off.
    `tests/test_sqlglotc.py` is not imported up front: it loads no sqlglot
    module, only setuptools, which costs as much as all the other test modules
    together (a job that runs it imports it itself).

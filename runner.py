@@ -609,6 +609,8 @@ def run_tests(order, out_fd, mass_stop=True, dyn=None):
                 klass._br_setup_failed = True
             _DEFER_DUCK["setup"] = False
         if getattr(klass, "_br_setup_failed", False):
+            if restore is not None:
+                restore()
             any_failed = True
             n_done += 1
             n_bad += 1
@@ -1095,6 +1097,19 @@ def batch_main(warm, jobs, out_fd):
     os.dup2(devnull, 2)
     try:
         import analyze
+        import copy
+        top = sys.modules.get("sqlglot")
+        top_vars = dict(vars(top)) if top is not None else {}
+        try:
+            schema0 = copy.deepcopy(top_vars.get("schema"))
+        except BaseException:
+            schema0 = None
+        import decimal
+        ctx0 = decimal.getcontext().copy()
+        state0 = _global_state()
+        mods0 = set(sys.modules)
+        n_done = 0
+        test_dirty = int(os.environ.get("BR_BATCH_TEST_DIRTY", "0"))     # (testing the restart path)
         for _cid, job in jobs:
             sys.stdout = io.StringIO()
             sys.stderr = io.StringIO()
@@ -1120,11 +1135,41 @@ def batch_main(warm, jobs, out_fd):
                 pass
             if not wrote:
                 os.write(out_fd, b"DONE\n")
+            if not dirty:
+                # what the tests may have left behind: names rebound in the sqlglot package
+                # (TestOptimizer's class setup replaces the default schema), interpreter
+                # settings, the ours-modules that are loaded; when that cannot be put back,
+                # the commits after this one go to a new child
+                try:
+                    warm.revert()
+                    builtins.open, io.open = opens      # (a data file overlay)
+                    if top is not None:
+                        cur = vars(top)
+                        for k in [k for k in cur if k not in top_vars]:
+                            del cur[k]
+                        for k, v in top_vars.items():
+                            if cur.get(k, top_vars) is not v:
+                                cur[k] = v
+                        if schema0 is not None:
+                            cur["schema"] = copy.deepcopy(schema0)
+                    decimal.setcontext(ctx0.copy())     # (flags that arithmetic in a test raised)
+                    n_done += 1
+                    if test_dirty and n_done >= test_dirty:
+                        dirty = True
+                    state1 = _global_state()
+                    if state1 != state0 or \
+                            any(_ours(n) and not n.startswith("tests") for n in set(sys.modules) ^ mods0):
+                        dirty = True
+                        if os.environ.get("BR_BATCH_LOG"):
+                            with open(os.environ["BR_BATCH_LOG"], "a") as f:
+                                f.write("dirty after %s: %r %r\n" % (
+                                    _cid, [i for i, (a, b) in enumerate(zip(state0, state1)) if a != b],
+                                    sorted(n for n in set(sys.modules) ^ mods0 if _ours(n))[:5]))
+                except BaseException:
+                    dirty = True
             if dirty:
                 os.write(out_fd, b"DIRTY\n")
                 break
-            warm.revert()
-            builtins.open, io.open = opens      # (a data file overlay)
     except BaseException:
         pass
     os._exit(0)
@@ -1183,7 +1228,11 @@ def run_batches(warm, batches, parallel=1, log=None, deadline=None):
                             a["next"] = 0
                             a["t_last"] = now
                             continue
-                        num, st, _secs = line.split()
+                        try:
+                            num, st, _secs = line.split()
+                            int(num)
+                        except ValueError:
+                            continue
                         a["res"][int(num)] = st
                         if a["idx"] < len(a["jobs"]):
                             try:
@@ -1216,11 +1265,16 @@ def run_batches(warm, batches, parallel=1, log=None, deadline=None):
                 active.remove(a)
                 rest = []
                 if not finished:
-                    # the commit in progress keeps what it has; the ones after it start over
-                    cid = a["jobs"][a["idx"]][0]
-                    if cid not in out:
-                        out[cid] = a["res"]
-                    rest = a["jobs"][a["idx"] + 1:]
+                    started = bool(a["res"]) or a["next"] > 0
+                    if not started and (a["dirty"] or a["idx"] > 0) and not a["dead"]:
+                        # the child stopped between two commits: all that is left starts over
+                        rest = a["jobs"][a["idx"]:]
+                    else:
+                        # the commit in progress keeps what it has; the ones after it start over
+                        cid = a["jobs"][a["idx"]][0]
+                        if cid not in out:
+                            out[cid] = a["res"]
+                        rest = a["jobs"][a["idx"] + 1:]
                 if a["jobs"]:
                     CHILD_CPU[a["jobs"][0][0]] = cpu
                     for cid, _j in a["jobs"][1:]:
