@@ -50,6 +50,10 @@ Picks the sqlglot tests a patch can break, and splits them across workers.
      re-imported; when a fixture is edited, the tests set everything up for real.
    - **Source read as text.** When a test reads a source file as text (for
      example, `test_typing`), it is served the patched text.
+   - **The optimizer tests' duckdb tables** are created when a test first
+     uses the connection, not in the class setup: the setup statements are
+     plain duckdb SQL from the test file, and most of the class's tests never
+     touch the connection. (Not when the patch changes the tests themselves.)
    - **The two slowest tests** (`probes.bin`) are stood in for by probes.
      `test_execute_tpcds` runs only a few of the TPC-DS queries that execute
      the changed lines. `test_max_nodes` runs its own checks on a smaller

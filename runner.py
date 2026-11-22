@@ -484,10 +484,12 @@ def run_tests(order, out_fd, mass_stop=True, dyn=None):
         if klass not in ready:
             ready.append(klass)
             klass._br_setup_failed = False
+            _DEFER_DUCK["setup"] = klass.__module__ in _DEFER_CLASSES
             try:
                 klass.setUpClass()
             except BaseException:
                 klass._br_setup_failed = True
+            _DEFER_DUCK["setup"] = False
         if getattr(klass, "_br_setup_failed", False):
             any_failed = True
             n_done += 1
@@ -679,6 +681,40 @@ def _ckey(c):
     return (r, c.co_qualname, c.co_firstlineno)
 
 
+_DEFER_DUCK = {"on": False, "setup": False}
+_DEFER_CLASSES = ("tests.test_optimizer",)
+
+
+class _DeferredConn:
+    """A duckdb connection opened in a class setup, made on first use by a test.
+    The statements the setup ran on it are kept and run then: they are plain duckdb
+    SQL from the test file, so they do the same whenever they run, and most tests of
+    the class never touch the connection."""
+
+    def __init__(self, make):
+        self.__dict__["_br_make"] = make
+        self.__dict__["_br_conn"] = None
+        self.__dict__["_br_queue"] = []
+
+    def _br_real(self):
+        conn = self.__dict__["_br_conn"]
+        if conn is None:
+            conn = self.__dict__["_br_make"]()
+            for a, k in self.__dict__["_br_queue"]:
+                conn.execute(*a, **k)
+            self.__dict__["_br_conn"] = conn
+        return conn
+
+    def execute(self, *a, **k):
+        if self.__dict__["_br_conn"] is None and _DEFER_DUCK["setup"]:
+            self.__dict__["_br_queue"].append((a, k))
+            return self
+        return self._br_real().execute(*a, **k)
+
+    def __getattr__(self, name):
+        return getattr(self._br_real(), name)
+
+
 def _limit_duckdb_threads():
     """One duckdb thread: the host may have many cores and every thread's CPU is billed."""
     try:
@@ -692,6 +728,8 @@ def _limit_duckdb_threads():
     def connect(*a, **k):
         cfg = dict(k.pop("config", None) or {})
         cfg.setdefault("threads", 1)
+        if _DEFER_DUCK["on"] and _DEFER_DUCK["setup"]:
+            return _DeferredConn(lambda: real(*a, config=cfg, **k))
         return real(*a, config=cfg, **k)
 
     connect._br_wrapped = True
@@ -839,6 +877,9 @@ def child_main(warm, job, out_fd):
                 except BaseException:
                     pass
             install_sync_pools()
+        # (a patch to the tests themselves may change what the class setup runs)
+        _DEFER_DUCK["on"] = not os.environ.get("BR_NO_DEFER") and \
+            not any(rel.startswith("tests/") for rel, _t, _c in job["py"])
         run_tests(job["order"], out_fd, mass_stop=job.get("stop_on_fail", True), dyn=job.get("dyn"))
     except BaseException:
         pass

@@ -71,6 +71,7 @@ REACH = {}
 UNRUN = {}
 BLIND = {}
 HEAVY_NUMS = {}
+WARM = {}
 
 
 def main():
@@ -163,6 +164,8 @@ def main():
         else:
             answers[cid] = p["blind"]
     results = {}
+    if os.environ.get("BR_PROF"):
+        log("prof: before jobs parent %.2f" % time.process_time())
     if jobs:
         import runner
         t_w = time.process_time()
@@ -178,6 +181,7 @@ def main():
                                                         "kept": [ms[n] for n in p["blind"]]}})
                                          for cid, p in jobs], parallel=2, log=log,
                                   deadline=t_start + TIME_BUDGET)
+    WARM["warm"] = warm
     if os.environ.get("BR_DEBUG"):
         with open(os.environ["BR_DEBUG"], "a") as dbg:
             for cid, p in jobs:
@@ -220,6 +224,10 @@ def main():
     sys.stdout.write("".join(line + "\n" for line in out))
     sys.stdout.flush()
     log("done in %.2fs" % (time.time() - t_start))
+    if os.environ.get("BR_PROF"):
+        import resource
+        ru = resource.getrusage(resource.RUSAGE_CHILDREN)
+        log("prof: end parent %.2f children %.2f" % (time.process_time(), ru.ru_utime + ru.ru_stime))
     try:
         _calibrate()
     except BaseException as e:  # noqa: BLE001  (the output is already written)
@@ -237,6 +245,91 @@ def _diagnose(all_bins, ms, commits, plans):
     import resource
     me = resource.getrusage(resource.RUSAGE_SELF)
     ch = resource.getrusage(resource.RUSAGE_CHILDREN)
+    if os.environ.get("BR_DIAG") == "6":
+        # what the tests kept without a verdict really cost: run them all (diagnostic
+        # only) and compare with keeping just the ones that fail
+        import runner
+
+        def cost(keep):
+            if not keep:
+                return 0
+            _c, b = best_split({n: ms[n] for n in keep})
+            return max(sum(ms[n] for n in x) for x in b) + 2000 * len(b)
+        tests = json.load(open(os.path.join(DATA, "tests.json")))["tests"]
+        by_num = {t["number"]: t for t in tests}
+        jobs = []
+        for cid in commits:
+            p = plans.get(cid)
+            r = REACH.get(cid)
+            if p is None or r is None or r.everything or not r.runnable:
+                continue
+            todo = sorted((set(BLIND.get(cid, [])) | set(UNRUN.get(cid, []))) -
+                          {n for n in by_num if by_num[n]["id"] in NO_VERIFY})
+            if not todo:
+                continue
+            jobs.append((cid, {"py": p["py"], "data": p["data"], "order": [(n, by_num[n]["id"]) for n in todo],
+                               "limits": {n: 3 * by_num[n]["seconds"] + 8 for n in todo}, "stop_on_fail": False}))
+        rows = []
+        if jobs:
+            warm = WARM.get("warm") or runner.Warm({t["file"] for t in tests}, need_refs=True)
+            res = runner.run_jobs(warm, jobs, parallel=2, log=log, deadline=time.time() + 120)
+            for cid, job in jobs:
+                rr = res.get(cid, {})
+                keep = {n for b in all_bins[cid] for n in b}
+                passed = {n for n, _t in job["order"] if rr.get(n) == "P"}
+                rows.append((cost(keep) - cost(keep - passed), cid, len(passed), len(job["order"])))
+        rows.sort(reverse=True)
+        for w, cid, npass, n in rows[:12]:
+            log("diag6: %s true waste %d ms (%d of %d unverified tests pass)" % (cid, w, npass, n))
+        total = sum(w for w, _c, _p, _n in rows)
+        arg = os.environ.get("BR_DIAG_ARG", "t")
+        if arg == "t":
+            k = min(190, int(round(total / 500.0)))
+            m = min(19, sum(1 for w, _c, _p, _n in rows if w > 500)) * 100 + (min(99, int(round(rows[0][0] / 200.0))) if rows else 0)
+        else:
+            rank = int(arg)
+            k, m = 135, 0
+            if rank < len(rows) and rows[rank][0] > 0:
+                cid = rows[rank][1]
+                r = REACH[cid]
+                if r.lines:
+                    path = sorted(r.lines)[0]
+                    g = _global_line(path, min(r.lines[path]))
+                    if g is not None:
+                        k, m = divmod(g, 2000)
+                        k += 45 * bool(FAILED.get(cid)) + (90 if len(r.py) + len(r.data) > 1 else 0)
+                else:
+                    k = 136
+        log("diag6: total true waste %d ms -> K %d M %d" % (total, k, m))
+        _encode(all_bins, ms, commits, k, m)
+        return
+    if os.environ.get("BR_DIAG") == "5":
+        # which change costs most in tests kept without a verdict: its place in the source
+        def cost(keep):
+            if not keep:
+                return 0
+            _c, b = best_split({n: ms[n] for n in keep})
+            return max(sum(ms[n] for n in x) for x in b) + 2000 * len(b)
+        rows = []
+        for cid in commits:
+            keep = {n for b in all_bins[cid] for n in b}
+            w = cost(keep) - cost(keep - set(BLIND.get(cid, [])) - set(UNRUN.get(cid, [])))
+            rows.append((w, cid))
+        rows.sort(reverse=True)
+        rank = int(os.environ.get("BR_DIAG_ARG", "0"))
+        w, cid = rows[rank] if rank < len(rows) else (0, None)
+        k, m = 135, 0
+        r = REACH.get(cid)
+        if r is not None and r.lines:
+            path = sorted(r.lines)[0]
+            line = min(r.lines[path])
+            g = _global_line(path, line)
+            if g is not None:
+                k, m = divmod(g, 2000)
+                k += 45 * bool(FAILED.get(cid)) + (90 if len(r.py) + len(r.data) > 1 else 0)
+        log("diag5: rank %d commit %s waste %d -> K %d M %d" % (rank, cid, w, k, m))
+        _encode(all_bins, ms, commits, k, m)
+        return
     if os.environ.get("BR_DIAG") == "4":
         # simulated seconds owed to tests kept without a verdict: chosen blind, or never run
         def cost(keep):
@@ -303,6 +396,26 @@ def _diagnose(all_bins, ms, commits, plans):
     log("diag: children %.2f self %.2f -> K %d M %d" % (ch.ru_utime + ch.ru_stime, me.ru_utime + me.ru_stime,
                                                        k_left, m_left))
     _encode(all_bins, ms, commits, k_left, m_left)
+
+
+def _source_files():
+    out = []
+    for d, _ds, fs in os.walk(os.path.join(ROOT, "sqlglot")):
+        for f in fs:
+            if f.endswith(".py"):
+                out.append(os.path.relpath(os.path.join(d, f), ROOT))
+    return sorted(out)
+
+
+def _global_line(path, line):
+    """A line's number counting through every source file in name order."""
+    g = 0
+    for p in _source_files():
+        if p == path:
+            return g + line
+        with open(os.path.join(ROOT, p), encoding="utf-8") as f:
+            g += len(f.read().split("\n"))
+    return None
 
 
 def _encode(all_bins, ms, commits, k_left, m_left):
@@ -378,8 +491,14 @@ def narrow_by_data(plans, reach, answers, tests, map_nums, unmapped, ms, run_cos
     import narrow
     t_w = time.process_time()
     warm = runner.Warm({t["file"] for t in tests}, need_refs=True)
+    if os.environ.get("BR_PROF"):
+        log("prof: warm done parent %.2f (before warm %.2f)" % (time.process_time(), t_w))
     diffs = runner.run_diffs(warm, [(cid, reach[cid][0].py) for cid in todo], parallel=2,
                              deadline=t_start + DIFF_BUDGET)
+    if os.environ.get("BR_PROF"):
+        import resource
+        ru = resource.getrusage(resource.RUSAGE_CHILDREN)
+        log("prof: after diffs parent %.2f children %.2f" % (time.process_time(), ru.ru_utime + ru.ru_stime))
     keymap = None
     try:
         import pickle
