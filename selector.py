@@ -35,6 +35,7 @@ LAZY_CLOSURE = {"sqlglot/" + x for x in (
     "expressions/temporal.py generator.py helper.py jsonpath.py optimizer/__init__.py optimizer/scope.py parser.py "
     "parsers/__init__.py parsers/base.py schema.py time.py tokenizer_core.py tokens.py trie.py typing/__init__.py "
     "_version.py").split()}
+GENMEM_EST = 0.12
 CHILD_OVERHEAD = 0.03   # fork + patch + exit, swap mode
 REIMPORT_OVERHEAD = 0.6  # extra when module- or class-level code changed
 WARM_COST = 0.7
@@ -42,7 +43,10 @@ EXEC_CLASS = "tests/test_executor.py::TestExecutor"
 HEAVY = {
     "tests/test_executor.py::TestExecutor::test_execute_tpcds": "tpcds",
     "tests/test_parser.py::TestParser::test_max_nodes": "max_nodes",
+    "tests/test_generator.py::TestGenerator::test_generator_memory": "genmem",
 }
+if os.environ.get("BR_NO_GENMEM"):
+    del HEAVY["tests/test_generator.py::TestGenerator::test_generator_memory"]
 MIN_SUPPORT = 20       # other tests that must also run a changed line for a probe to stand in
 PROBE_QUERIES = int(os.environ.get("BR_PROBE_QUERIES", "5"))
 PROBE_EXTRA = int(os.environ.get("BR_PROBE_EXTRA", "2"))
@@ -655,6 +659,8 @@ def heavy_probe(kind, num, r, ctx):
             forced |= {i for i, item in enumerate(new_items) if item != old_items[i]}
             continue
         return None
+    if kind == "genmem":
+        return "PROBE:genmem", GENMEM_EST, 0.0
     qmask = 0
     for path, lines in r.lines.items():
         got = mp.file(path)
@@ -679,6 +685,10 @@ def heavy_probe(kind, num, r, ctx):
         return "PROBE:max_nodes", 0.35, 0.0
     pr = ctx["probes"]["tpcds"]
     allq = range(len(pr["times"]))
+    if not forced and not os.environ.get("BR_NO_SMALL"):
+        got = _small_probe(r, ctx, hbit, pr)
+        if got is not None:
+            return got
     pool = [i for i in allq if (qmask >> i) & 1] if qmask else list(allq)
     cheap = sorted((i for i in pool if not pr["execute"][i]), key=lambda i: pr["times"][i])[:PROBE_QUERIES]
     ex = sorted((i for i in pool if pr["execute"][i]), key=lambda i: pr["times"][i])[:PROBE_QUERIES]
@@ -692,6 +702,62 @@ def heavy_probe(kind, num, r, ctx):
     if not forced:
         pid += "|quiet"     # may be skipped when the other verified tests all pass
     return pid, est, extra_est
+
+
+SMALL_CHEAP = int(os.environ.get("BR_SMALL_CHEAP", "6"))
+SMALL_ROWS = int(os.environ.get("BR_SMALL_ROWS", "3"))
+SMALL_BIG = int(os.environ.get("BR_SMALL_BIG", "2"))
+SMALL_ALL = int(os.environ.get("BR_SMALL_ALL", "12"))
+SMALL_ALL_SECS = float(os.environ.get("BR_SMALL_ALL_SECS", "1.0"))
+
+
+def _small_probe(r, ctx, hbit, pr):
+    """The TPC-DS probe on the reduced tables (small.bin), or None when a changed line
+    is only reached on the full ones."""
+    mp = ctx["mp"]
+    if "small" not in ctx:
+        try:
+            import runner
+            sm = runner.load_small()
+            ctx["small"] = {"masks": sm["masks"], "times": {i: q["time"] for i, q in sm["q"].items()},
+                            "rows": {i for i, q in sm["q"].items() if q["rows"]}}
+        except Exception:
+            ctx["small"] = None
+    sm = ctx["small"]
+    if sm is None:
+        return None
+    nq = len(pr["times"])
+    exec_mask = sum(1 << i for i in range(nq) if pr["execute"][i])
+    usable = sum(1 << i for i in sm["times"])
+    qmask = 0
+    for path, lines in r.lines.items():
+        got = mp.file(path)
+        if got is None:
+            continue
+        cov = got[0]
+        for ln in lines:
+            e = cov.get(ln)
+            if not e or not ((e[0] | e[1]) & hbit):
+                continue
+            full = pr["masks"].get(path, {}).get(ln, 0)
+            small = sm["masks"].get(path, {}).get(ln, 0) & usable
+            if (full & exec_mask) and not small:
+                return None
+            qmask |= small | (full & ~exec_mask)
+    pool = [i for i in range(nq) if (qmask >> i) & 1] if qmask else list(range(nq))
+    parse = sorted((i for i in pool if not pr["execute"][i]), key=lambda i: pr["times"][i])[:PROBE_QUERIES]
+    ex_pool = [i for i in pool if i in sm["times"]]
+    if not ex_pool and not parse:
+        return None
+    if len(ex_pool) <= SMALL_ALL or sum(sm["times"][i] for i in ex_pool) <= SMALL_ALL_SECS:
+        ex = list(ex_pool)        # few queries reach the change: all of them
+    else:
+        ex = sorted(ex_pool, key=lambda i: sm["times"][i])[:SMALL_CHEAP]
+        ex += sorted((i for i in ex_pool if i in sm["rows"] and i not in ex), key=lambda i: sm["times"][i])[:SMALL_ROWS]
+        ex += sorted((i for i in ex_pool if i not in ex), key=lambda i: -pr["times"][i])[:SMALL_BIG]
+    est = 0.08 + sum(pr["times"][i] for i in parse) + sum(sm["times"][i] for i in ex)
+    pid = "PROBE:tpcds2:" + ",".join(map(str, sorted(parse))) + "|" + ",".join(map(str, sorted(ex))) + "|quiet"
+    return pid, est, 0.0
 
 
 def case_filter(tid, num, r, ctx):
@@ -932,6 +998,8 @@ def plan(cid, cand, r, ms, run_cost, setup_cost, by_num, reimport, ctx):
     for n, _pid, est, _extra in probes:
         probe_cost += est
         cls = by_num[n]["id"].rsplit("::", 1)[0]
+        if _pid.startswith("PROBE:tpcds2:"):
+            continue          # runs outside the test class: no class setup
         if cls not in classes0:
             classes0.add(cls)
             probe_cost += _setup(cls, setup_cost, reimport, data)

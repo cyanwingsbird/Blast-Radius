@@ -375,7 +375,117 @@ def _probe_case(tid, any_failed=False):
         klass = tp.TestParser
         klass._br_probe = _max_nodes_probe
         return klass, "_br_probe"
+    if kind == "tpcds2":
+        te = importlib.import_module("tests.test_executor")
+        parts = arg.split("|")
+        parse_idx = [int(x) for x in parts[0].split(",") if x]
+        exec_idx = [int(x) for x in parts[1].split(",") if x]
+
+        class _SmallTpcds(unittest.TestCase):
+            def runTest(self):
+                _small_tpcds_probe(self, te, parse_idx, exec_idx)
+
+        return _SmallTpcds, "runTest"
+    if kind == "genmem":
+        tg = importlib.import_module("tests.test_generator")
+        klass = tg.TestGenerator
+        klass._br_probe = _genmem_probe
+        return klass, "_br_probe"
     raise ValueError(tid)
+
+
+SMALL_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "small.bin")
+
+
+def load_small():
+    import zlib
+    with open(SMALL_FILE, "rb") as f:
+        return pickle.loads(zlib.decompress(f.read()))
+
+
+SMALL_LIMIT = float(os.environ.get("BR_SMALL_LIMIT", "1.5"))
+
+
+class _Blowup(AssertionError):
+    pass
+
+
+def _blowup(signum, frame):
+    raise _Blowup("query takes far longer than at the pinned commit")
+
+
+def _small_tpcds_probe(self, te, parse_idx, exec_idx):
+    """test_execute_tpcds on the first rows of each table.  What the pinned code answers
+    there was recorded with small.bin; the test passes at the pinned commit, so a query
+    that still gets the same answer, from the same duckdb SQL, is taken to still agree
+    with duckdb.  (On the fixtures' own tables nearly every query's answer is empty
+    already: their date table ends decades before the sales.)"""
+    from sqlglot import find_tables, parse_one, transpile
+    from sqlglot.executor import execute
+    from sqlglot.executor.table import Table
+
+    small = load_small()
+    sqls = list(te.load_sql_fixture_pairs("optimizer/tpc-ds/tpc-ds.sql"))
+    for i in parse_idx:
+        parse_one(sqls[i][1])
+    tables = {}
+    for i in exec_idx:
+        meta, sql, _ = sqls[i]
+        want = small["q"][i]
+        expression = pickle.loads(pickle.dumps(parse_one(sql)))
+        if not meta.get("execute"):
+            raise AssertionError("query %d is no longer executed" % i)
+        use = {}
+        for t in find_tables(expression):
+            name = t.name
+            if name not in tables:
+                columns, rows = small["tables"][name]
+                tables[name] = Table(columns=columns, rows=list(rows))
+            use[name] = tables[name]
+        # a plan that explodes (a join gone cross) kills the real test's worker on the
+        # full tables; here it shows as a query taking many times what it did
+        signal.signal(signal.SIGALRM, _blowup)
+        signal.setitimer(signal.ITIMER_REAL, max(SMALL_LIMIT, 10.0 * want["time"]))
+        try:
+            got = execute(expression, schema=te.TPCDS_SCHEMA, tables=use)
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+        if transpile(sql, write="duckdb")[0] != want["duck"]:
+            raise AssertionError("query %d: duckdb is sent other SQL" % i)
+        if tuple(got.columns) == want["columns"] and list(got.rows) == want["rows"]:
+            continue
+        import numpy as np
+        import pandas as pd
+        from pandas.testing import assert_frame_equal
+
+        a = pd.DataFrame(((np.nan if c is None else c for c in r) for r in want["rows"]), columns=want["columns"])
+        b = pd.DataFrame(((np.nan if c is None else c for c in r) for r in got.rows), columns=got.columns)
+        assert_frame_equal(a, b, check_dtype=False, check_index_type=False)
+
+
+def _genmem_probe(self):
+    """test_generator_memory with a quarter of the measured loop and of the allowance.
+    The loop still crosses a growth step of every container kind (a dict's at 170 and
+    341 entries, a set's at 307, a list's every few), so a leak per call shows."""
+    import tracemalloc
+    from sqlglot.dialects.dialect import Dialect, Dialects
+
+    for name in Dialects:
+        with self.subTest(dialect=name):
+            dialect = Dialect.get_or_raise(name)
+            for _ in range(100):
+                dialect.generator()
+            gc.collect()
+            tracemalloc.start()
+            try:
+                before = tracemalloc.get_traced_memory()[0]
+                for _ in range(250):
+                    dialect.generator()
+                gc.collect()
+                after = tracemalloc.get_traced_memory()[0]
+            finally:
+                tracemalloc.stop()
+            self.assertLess(after - before, 256)
 
 
 def _max_nodes_probe(self):

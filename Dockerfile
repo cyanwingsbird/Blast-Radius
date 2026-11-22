@@ -22,7 +22,7 @@ os.rename('/opt/sqlglot-${SQLGLOT_SHA}', '/opt/sqlglot')" \
  && PYTHONDONTWRITEBYTECODE= python -m compileall -q -j 4 /opt/sqlglot/sqlglot /opt/sqlglot/tests \
  && chmod -R a+rX /opt/sqlglot
 
-COPY selector.py analyze.py runner.py datadiff.py narrow.py costs.json map.bin probes.bin casemap.bin callmap.bin keymap.bin cmpmap.bin /app/
+COPY selector.py analyze.py runner.py datadiff.py narrow.py costs.json map.bin probes.bin casemap.bin callmap.bin keymap.bin cmpmap.bin small.bin /app/
 RUN chmod -R a+rX /app && PYTHONDONTWRITEBYTECODE= python -m compileall -q /app
 # the executor tests' tables, built once from the pinned commit (the run falls back to building them)
 RUN cd /app && python -c "import runner; runner.save_exec_cache()" ; chmod a+r /app/execcache.pickle || true

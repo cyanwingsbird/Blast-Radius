@@ -54,6 +54,18 @@ Picks the sqlglot tests a patch can break, and splits them across workers.
      uses the connection, not in the class setup: the setup statements are
      plain duckdb SQL from the test file, and most of the class's tests never
      touch the connection. (Not when the patch changes the tests themselves.)
+   - **`test_execute_tpcds` on reduced tables** (`small.bin`). The test runs
+     57 queries on the sqlglot executor and compares each with duckdb. The
+     probe runs the queries that reach the change on the first 1000 rows of
+     each table and compares with what the pinned code answers there (and
+     with the duckdb SQL the test would send), recorded in `small.bin`. All
+     such queries when they are few, otherwise the cheapest ones, some with
+     non-empty answers, and the heaviest. A query taking ten times its
+     recorded time counts as a failure: a join gone cross kills the real
+     test's worker. A changed line only the full tables reach falls back to
+     the older probe.
+   - **`test_generator_memory`** with a quarter of the measured loop and of
+     the allowance.
    - **The two slowest tests** (`probes.bin`) are stood in for by probes.
      `test_execute_tpcds` runs only a few of the TPC-DS queries that execute
      the changed lines. `test_max_nodes` runs its own checks on a smaller
@@ -137,6 +149,7 @@ commit:
 | `costs.json` | `measure.py` |
 | `keymap.bin` | `keyrec.py` with `brrec.py` (records the keys each test looks up, on an instrumented copy whose lines do not move) |
 | `cmpmap.bin` | `cmprec.py` with `cmprt.py` (records the kinds of operand pairs each comparison sees, on an instrumented copy); `cmpcheck.py` runs the tests the narrowing drops on random operator swaps |
+| `small.bin` | `buildsmall.py`; `tpcheck.py` compares the probe with the real test on mutants |
 | `narrow.idx` (in the image) | built by `narrow.py` during the image build |
 | `execcache.pickle`, `duckcache.pickle`, `refs.pickle` (in the image) | built by `runner.py` during the image build: executor tables, duckdb results of the pinned queries, module reference map |
 
