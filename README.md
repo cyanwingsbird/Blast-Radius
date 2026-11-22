@@ -19,13 +19,12 @@ Picks the sqlglot tests a patch can break, and splits them across workers.
      tokenizer/parser/generator). The exception is a class that is
      instantiated while modules import (recorded with its ancestors). For
      those, every test that loads the module is in reach.
-   - An edit to a SQL fixture, in a patch whose Python files compile unchanged,
-     is not verified when exactly one test reads that fixture and an edited
-     statement of a (statement, expected) pair no longer parses or parses to
-     another tree: such an edit all but always breaks that test, so the test is
-     scheduled as it is. Edits that parse to the same tree (a dropped optional
-     keyword, spacing), edits after the last complete pair (which no test
-     looks at) and fixtures read line by line are verified like any other.
+   - Off by default (`BR_FIX_BLIND=1` turns it on): an edit to a SQL fixture,
+     in a patch whose Python files compile unchanged, is not verified when
+     exactly one test reads that fixture and an edited statement of a
+     (statement, expected) pair no longer parses or parses to another tree.
+     Measured on the board it saved next to nothing and once kept a test that
+     passes, so every such test is run like any other.
 2. **Verification** (`runner.py`). Candidate tests are run in the container
    against the patched code. The pinned sqlglot and its tests are imported
    once, and each commit gets a forked child. The child swaps in the changed
@@ -87,6 +86,8 @@ Picks the sqlglot tests a patch can break, and splits them across workers.
      query. If a changed line is run by the real test but neither by the
      probe nor by at least 20 other tests, the real test is kept. An edit to
      the TPC-DS fixture probes exactly the queries that changed.
+   The executor tests' tables (20 MB of pickle) are loaded only when a job runs
+   one of those tests, and after the other jobs have been forked.
 3. **Data diff** (`datadiff.py`, `narrow.py`, `keymap.bin`). A change to a
    module or class body mostly changes data that sqlglot builds as it imports:
    a flag, a dict entry, a set member. When the candidates are worth it, a

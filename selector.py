@@ -211,18 +211,32 @@ def main():
         t_w = time.process_time()
         need_refs = any(p.get("reimport") for _c, p in jobs)
         if warm is None or (need_refs and warm.refs is None):
-            warm = runner.Warm({by_num[n]["file"] for _c, p in jobs for n, _ in p["order"]}, need_refs=need_refs)
-        if any(by_num[n]["file"] == "tests/test_executor.py" for _c, p in jobs for n, _ in p["order"]):
-            warm.load_exec()
+            warm = runner.Warm({by_num[n]["file"] for _c, p in jobs for n, _ in p["order"]}, need_refs=need_refs,
+                               exec_cache=False)
         log("warm cpu %.2f, analysis cpu %.2f" % (time.process_time() - t_w, t_w))
         jobs.sort(key=lambda j: -j[1]["est"])
-        results = runner.run_jobs(warm, [(cid, {"py": p["py"], "data": p["data"], "order": p["order"],
-                                                "limits": p["limits"], "stop_on_fail": True,
-                                                "dyn": {"ms": {n: ms[n] for n, _t in p["order"]},
-                                                        "rc": {n: p["rc"].get(n, 0.0) for n, _t in p["order"]},
-                                                        "kept": [ms[n] for n in p["blind"]]}})
-                                         for cid, p in jobs], parallel=2, log=log,
-                                  deadline=t_start + TIME_BUDGET)
+
+        def uses_tables(p):
+            # a TestExecutor test (the reduced TPC-DS probe brings its own tables)
+            return any(by_num[n]["file"] == "tests/test_executor.py" and
+                       not (isinstance(tid, str) and tid.startswith("PROBE:tpcds2:")) for n, tid in p["order"])
+
+        # the jobs that do not need the executor tables run first, forked from a process
+        # that has not loaded them yet (20 MB of pickle; every fork carries what is loaded)
+        results = {}
+        for want in (False, True):
+            part = [(cid, p) for cid, p in jobs if uses_tables(p) == want]
+            if not part:
+                continue
+            if want:
+                warm.load_exec()
+            results.update(runner.run_jobs(
+                warm, [(cid, {"py": p["py"], "data": p["data"], "order": p["order"],
+                              "limits": p["limits"], "stop_on_fail": True,
+                              "dyn": {"ms": {n: ms[n] for n, _t in p["order"]},
+                                      "rc": {n: p["rc"].get(n, 0.0) for n, _t in p["order"]},
+                                      "kept": [ms[n] for n in p["blind"]]}})
+                       for cid, p in part], parallel=2, log=log, deadline=t_start + TIME_BUDGET))
     WARM["warm"] = warm
     if os.environ.get("BR_DEBUG"):
         with open(os.environ["BR_DEBUG"], "a") as dbg:
@@ -632,7 +646,7 @@ def _calibrate():
     log("calibration cpu %.2f" % (time.process_time() - t))
 
 
-FIX_BLIND = int(os.environ.get("BR_FIX_BLIND", "1"))   # most tests a fixture-only change may leave unverified
+FIX_BLIND = int(os.environ.get("BR_FIX_BLIND", "0"))   # most tests a fixture-only change may leave unverified
 DIFF_MIN = 0.8        # candidate CPU above which a data diff is worth its re-import
 DIFF_BUDGET = 25.0    # seconds from the start
 
