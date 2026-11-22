@@ -652,6 +652,7 @@ def _calibrate():
 
 
 FIX_BLIND = int(os.environ.get("BR_FIX_BLIND", "0"))   # most tests a fixture-only change may leave unverified
+LATE_FILES = {"tests/test_sqlglotc.py"}
 DIFF_MIN = 0.8        # candidate CPU above which a data diff is worth its re-import
 DIFF_BUDGET = 25.0    # seconds from the start
 
@@ -683,7 +684,9 @@ def narrow_by_data(plans, reach, answers, tests, map_nums, unmapped, ms, run_cos
     import narrow
     t_w = time.process_time()
     # (the executor tables are loaded later, if a job turns out to need them)
-    warm = runner.Warm({t["file"] for t in tests}, need_refs=True, exec_cache=False)
+    # (not tests/test_sqlglotc.py: it loads no sqlglot module, only setuptools, which costs
+    # as much as all the other test modules together; a job that runs it imports it itself)
+    warm = runner.Warm({t["file"] for t in tests} - LATE_FILES, need_refs=True, exec_cache=False)
     if os.environ.get("BR_PROF"):
         log("prof: warm done parent %.2f (before warm %.2f)" % (time.process_time(), t_w))
     diffs = runner.run_diffs(warm, [(cid, reach[cid][0].py) for cid in todo], parallel=2,
