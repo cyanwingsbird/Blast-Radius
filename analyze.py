@@ -362,24 +362,9 @@ def _cmp_truth(op, cls):
     return rel in (_GT, _EQO)
 
 
-def _cmp_swaps(old_text, new_text):
-    """[(line, col, old operator, new operator)] when the sources differ only in the
-    operator of one-operator comparisons; None otherwise."""
-    a_lines, b_lines = old_text.split("\n"), new_text.split("\n")
-    if len(a_lines) == len(b_lines):
-        # (the usual case, checked on the changed lines alone before anything is parsed)
-        for x, y in zip(a_lines, b_lines):
-            if x != y and _CMP_TOKEN.sub("?", x) != _CMP_TOKEN.sub("?", y):
-                return None
-    if _CMP_TOKEN.sub("?", old_text) != _CMP_TOKEN.sub("?", new_text):
-        # (comment-only lines added next to the swap are tolerated below)
-        strip = lambda t: "\n".join(l for l in _CMP_TOKEN.sub("?", t).split("\n") if not l.lstrip().startswith("#"))
-        if strip(old_text) != strip(new_text):
-            return None
-    try:
-        a, b = ast.parse(old_text), ast.parse(new_text)
-    except Exception:
-        return None
+def _walk_swaps(a, b, line_off=0, col_off=0):
+    """The one-operator comparisons whose operator differs between two trees that are
+    otherwise the same: [(line, col, old operator, new operator)], or None."""
     out = []
     stack = [(a, b)]
     while stack:
@@ -389,7 +374,8 @@ def _cmp_swaps(old_text, new_text):
         if isinstance(x, ast.Compare) and len(x.ops) == 1 and len(y.ops) == 1 and type(x.ops[0]) is not type(y.ops[0]):
             if type(x.ops[0]) not in _CMP_OPS or type(y.ops[0]) not in _CMP_OPS:
                 return None
-            out.append((x.lineno, x.col_offset, _CMP_OPS.index(type(x.ops[0])), _CMP_OPS.index(type(y.ops[0]))))
+            out.append((x.lineno + line_off, x.col_offset + col_off,
+                        _CMP_OPS.index(type(x.ops[0])), _CMP_OPS.index(type(y.ops[0]))))
             stack.append((x.left, y.left))
             stack.append((x.comparators[0], y.comparators[0]))
             continue
@@ -411,7 +397,99 @@ def _cmp_swaps(old_text, new_text):
                         return None
             elif u != v or type(u) is not type(v):
                 return None
-    return out or None
+    return out
+
+
+def _def_block(lines, i):
+    """(first, end, indent) of the function whose body holds line i, found by indentation
+    alone; None when that is not clear cut (then the whole file is parsed)."""
+    def indent(l):
+        return len(l) - len(l.lstrip(" "))
+
+    def code(l):
+        t = l.strip()
+        return bool(t) and not t.startswith("#")
+
+    if not code(lines[i]) or "\t" in lines[i]:
+        return None
+    cur = indent(lines[i])
+    j = i - 1
+    while j >= 0:
+        l = lines[j]
+        if code(l):
+            if "\t" in l[:len(l) - len(l.lstrip())]:
+                return None
+            k = indent(l)
+            if k < cur:
+                t = l.lstrip()
+                if t.startswith(("def ", "async def ")):
+                    break
+                cur = k
+                if k == 0:
+                    return None
+        j -= 1
+    if j < 0:
+        return None
+    base = indent(lines[j])
+    end = j + 1
+    while end < len(lines) and (not code(lines[end]) or indent(lines[end]) > base):
+        end += 1
+    if end <= i:
+        return None
+    return j, end, base
+
+
+def _cmp_swaps_local(a_lines, b_lines, changed):
+    """_cmp_swaps for sources of equal length, parsing only the functions that hold the
+    changed lines.  None when that cannot be done (not: when there are no swaps)."""
+    blocks = set()
+    for i in changed:
+        blk = _def_block(a_lines, i)
+        if blk is None or _def_block(b_lines, i) != blk:
+            return None
+        blocks.add(blk)
+    out = []
+    for first, end, base in sorted(blocks):
+        try:
+            a = ast.parse("\n".join(l[base:] for l in a_lines[first:end]))
+            b = ast.parse("\n".join(l[base:] for l in b_lines[first:end]))
+        except Exception:
+            return None
+        if len(a.body) != 1 or not isinstance(a.body[0], (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return None
+        got = _walk_swaps(a, b, first, base)
+        if got is None:
+            return []
+        out.extend(got)
+    return out
+
+
+def _cmp_swaps(old_text, new_text):
+    """[(line, col, old operator, new operator)] when the sources differ only in the
+    operator of one-operator comparisons; None otherwise."""
+    a_lines, b_lines = old_text.split("\n"), new_text.split("\n")
+    if len(a_lines) == len(b_lines):
+        # (the usual case, checked on the changed lines alone before anything is parsed)
+        changed = []
+        for i, (x, y) in enumerate(zip(a_lines, b_lines)):
+            if x != y:
+                if _CMP_TOKEN.sub("?", x) != _CMP_TOKEN.sub("?", y):
+                    return None
+                changed.append(i)
+        if changed and not os.environ.get("BR_CMP_FULL"):
+            got = _cmp_swaps_local(a_lines, b_lines, changed)
+            if got is not None:
+                return got or None
+    if _CMP_TOKEN.sub("?", old_text) != _CMP_TOKEN.sub("?", new_text):
+        # (comment-only lines added next to the swap are tolerated below)
+        strip = lambda t: "\n".join(l for l in _CMP_TOKEN.sub("?", t).split("\n") if not l.lstrip().startswith("#"))
+        if strip(old_text) != strip(new_text):
+            return None
+    try:
+        a, b = ast.parse(old_text), ast.parse(new_text)
+    except Exception:
+        return None
+    return _walk_swaps(a, b) or None
 
 
 def cmp_infected(mp, path, old_text, new_text):

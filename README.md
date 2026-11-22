@@ -127,7 +127,9 @@ Picks the sqlglot tests a patch can break, and splits them across workers.
    on. Pairs whose comparison could run sqlglot code (two expressions of the
    same class, for example) count as disagreeing, and so does any pair compared
    while modules import. A swap such as `x is None` to `x == None` that no test
-   can tell apart costs nothing.
+   can tell apart costs nothing. To find the swaps, only the functions that
+   hold the changed lines are parsed (the whole file when that is not clear
+   cut).
 5. **Cost model** (`selector.py`). Per commit, verify the candidates whose CPU
    (`costs.json`) is less than what scheduling them blind would cost. After a
    failure, verification carries on unless at least half of what has run
