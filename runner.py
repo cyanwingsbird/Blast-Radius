@@ -938,6 +938,9 @@ class Warm:
         except Exception:
             self.exec_cache = None
 
+    def load_tpcds(self):
+        _unpack_tpcds(self.exec_cache)
+
     def apply(self, py, data, sig, load_old, use_cache=True):
         """In the child: make the patched sources live.  py: [(rel, text, new_code)]."""
         reimport = False
@@ -999,6 +1002,8 @@ def child_main(warm, job, out_fd):
     sys.stderr = io.StringIO()
     try:
         import analyze
+        if needs_tpcds(job["order"]):
+            warm.load_tpcds()       # (the parent has, normally)
         reimport = warm.apply(job["py"], job["data"], analyze._sig,
                               lambda rel: analyze.load_old_code(ROOT, rel, open(os.path.join(ROOT, rel)).read()))
         if reimport:
@@ -1305,6 +1310,9 @@ def save_exec_cache(path=EXEC_CACHE_FILE):
     _limit_duckdb_threads()
     cache = _build_exec_cache()
     cache["root"] = os.path.realpath(ROOT)
+    # three quarters of the file are the TPC-DS tables, which only test_execute_tpcds
+    # reads: packed on their own, to be unpacked when that test is going to run
+    cache["tpcds_blob"] = pickle.dumps(cache.pop("tpcds_tables"), protocol=5)
     with open(path, "wb") as f:
         pickle.dump(cache, f, protocol=5)
 
@@ -1375,6 +1383,28 @@ def _load_duck_cache():
         _DUCK_CACHE = {}
 
 
+def _unpack_tpcds(cache):
+    """Make the TPC-DS tables of a loaded executor cache usable."""
+    if cache is not None and "tpcds_tables" not in cache and "tpcds_blob" in cache:
+        enabled = gc.isenabled()
+        gc.disable()
+        try:
+            cache["tpcds_tables"] = pickle.loads(cache["tpcds_blob"])
+        finally:
+            if enabled:
+                gc.enable()
+
+
+def needs_tpcds(order):
+    """Whether a job runs test_execute_tpcds on the fixtures' own tables (the reduced
+    probe has its tables in small.bin)."""
+    for _num, tid in order:
+        name = tid[1] if isinstance(tid, tuple) else tid
+        if name.startswith("PROBE:tpcds:") or name.endswith("::test_execute_tpcds"):
+            return True
+    return False
+
+
 def save_duck_cache(path=DUCK_FILE):
     """Build time: run the executor tests and keep every duckdb result they fetch."""
     global _DUCK_RECORD
@@ -1384,6 +1414,7 @@ def save_duck_cache(path=DUCK_FILE):
     _limit_duckdb_threads()
     install_sync_pools()
     cache = _load_exec_cache() or _build_exec_cache()
+    _unpack_tpcds(cache)
     _use_exec_cache(cache)
     install_sync_pools()
     import tests.test_executor as te
@@ -1474,7 +1505,8 @@ def _use_exec_cache(cache, reload_sqls=False):
         cls.tpch_conn = _LazyConn(te.DIR_TPCH, TPCH_SCHEMA)
         cls.tpcds_conn = _LazyConn(te.DIR_TPCDS, TPCDS_SCHEMA)
         cls.tpch_tables = cache["tpch_tables"]
-        cls.tpcds_tables = cache["tpcds_tables"]
+        # (unpacked by now whenever the job runs test_execute_tpcds, its only reader)
+        cls.tpcds_tables = cache.get("tpcds_tables", {})
         cls.cache = {}
         if reload_sqls:
             cls.tpch_sqls = list(te.load_sql_fixture_pairs("optimizer/tpc-h/tpc-h.sql"))

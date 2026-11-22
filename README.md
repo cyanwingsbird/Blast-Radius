@@ -87,7 +87,9 @@ Picks the sqlglot tests a patch can break, and splits them across workers.
      probe nor by at least 20 other tests, the real test is kept. An edit to
      the TPC-DS fixture probes exactly the queries that changed.
    The executor tests' tables (20 MB of pickle) are loaded only when a job runs
-   one of those tests, and after the other jobs have been forked.
+   one of those tests, and after the other jobs have been forked. The TPC-DS
+   tables, three quarters of it, are unpacked only for `test_execute_tpcds`
+   itself, their one reader.
 3. **Data diff** (`datadiff.py`, `narrow.py`, `keymap.bin`). A change to a
    module or class body mostly changes data that sqlglot builds as it imports:
    a flag, a dict entry, a set member. When the candidates are worth it, a

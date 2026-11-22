@@ -217,19 +217,24 @@ def main():
         jobs.sort(key=lambda j: -j[1]["est"])
 
         def uses_tables(p):
-            # a TestExecutor test (the reduced TPC-DS probe brings its own tables)
-            return any(by_num[n]["file"] == "tests/test_executor.py" and
-                       not (isinstance(tid, str) and tid.startswith("PROBE:tpcds2:")) for n, tid in p["order"])
+            # 1: a TestExecutor test (the reduced TPC-DS probe brings its own tables);
+            # 2: test_execute_tpcds itself, the one reader of the TPC-DS tables
+            if runner.needs_tpcds(p["order"]):
+                return 2
+            return int(any(by_num[n]["file"] == "tests/test_executor.py" and
+                           not (isinstance(tid, str) and tid.startswith("PROBE:tpcds2:")) for n, tid in p["order"]))
 
         # the jobs that do not need the executor tables run first, forked from a process
         # that has not loaded them yet (20 MB of pickle; every fork carries what is loaded)
         results = {}
-        for want in (False, True):
+        for want in (0, 1, 2):
             part = [(cid, p) for cid, p in jobs if uses_tables(p) == want]
             if not part:
                 continue
             if want:
                 warm.load_exec()
+            if want == 2:
+                warm.load_tpcds()
             results.update(runner.run_jobs(
                 warm, [(cid, {"py": p["py"], "data": p["data"], "order": p["order"],
                               "limits": p["limits"], "stop_on_fail": True,
