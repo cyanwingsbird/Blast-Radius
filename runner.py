@@ -1006,6 +1006,7 @@ class Running:
 
 
 CHILD_CPU = {}
+TEST_SECS = {}
 
 
 def run_jobs(warm, jobs, parallel=2, log=None, deadline=None):
@@ -1060,6 +1061,10 @@ def run_jobs(warm, jobs, parallel=2, log=None, deadline=None):
                         if os.environ.get("BR_TIMES"):
                             sys.stderr.write("T %s %s %s %s\n" % (a.cid, num, st, _secs))
                         a.results[int(num)] = st
+                        try:
+                            TEST_SECS[(a.cid, int(num))] = float(_secs)
+                        except ValueError:
+                            pass
                         a.next_idx += 1
                         a.t_last = now
                         if st == "T":

@@ -254,6 +254,37 @@ def _diagnose(all_bins, ms, commits, plans):
     import resource
     me = resource.getrusage(resource.RUSAGE_SELF)
     ch = resource.getrusage(resource.RUSAGE_CHILDREN)
+    if os.environ.get("BR_DIAG") == "9":
+        # where the verification CPU goes, by kind of test
+        import runner
+        tests = json.load(open(os.path.join(DATA, "tests.json")))["tests"]
+        tid = {t["number"]: t["id"] for t in tests}
+        cat = {}
+        for (cid, n), secs in runner.TEST_SECS.items():
+            i = tid.get(n, "")
+            if "test_execute_tpcds" in i:
+                c = "tpcds"
+            elif i.endswith("TestParser::test_max_nodes"):
+                c = "maxnodes"
+            elif "test_generator_memory" in i:
+                c = "genmem"
+            elif "::TestOptimizer::" in i:
+                c = "optimizer"
+            elif "::TestExecutor::" in i:
+                c = "executor"
+            else:
+                c = "rest"
+            cat[c] = cat.get(c, 0.0) + secs
+        cat["overhead"] = sum(runner.CHILD_CPU.values()) - sum(cat.values())
+        log("diag9: " + " ".join("%s %.2f" % kv for kv in sorted(cat.items())) + " jobs %d" % len(runner.CHILD_CPU))
+        trio = (("tpcds", "maxnodes", "genmem"), ("overhead", "optimizer", "executor"),
+                ("rest", "jobs", "none"))[int(os.environ.get("BR_DIAG_ARG", "0"))]
+        cat["jobs"] = len(runner.CHILD_CPU) * 0.2
+        k = min(140, int(round(max(0.0, cat.get(trio[0], 0.0)) / 0.2)))
+        y = min(49, int(round(max(0.0, cat.get(trio[1], 0.0)) / 0.2)))
+        z = min(39, int(round(max(0.0, cat.get(trio[2], 0.0)) / 0.25)))
+        _encode(all_bins, ms, commits, k, y * 40 + z)
+        return
     if os.environ.get("BR_DIAG") == "8":
         # the CPU split: this process (analysis, warm-up, data diffs' parent side) in tenths,
         # the verification children in fiftieths
