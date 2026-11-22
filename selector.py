@@ -144,14 +144,14 @@ def main():
         # (an edited fixture changes the queries, so recorded duckdb results do not apply either)
         exec_setup = r.data or any(p.startswith(("sqlglot/executor/", "tests/", "sqlglot/helper"))
                                    for p, _t, _c in r.py)
-        plans[cid] = plan(cid, cand, r, ms, run_cost_reimport if exec_setup else run_cost, setup_cost,
-                          by_num, reimport, ctx)
-        reach[cid] = (r, cand, reimport)
+        costs_here = run_cost_reimport if exec_setup else run_cost
+        plans[cid] = plan(cid, cand, r, ms, costs_here, setup_cost, by_num, reimport, ctx)
+        reach[cid] = (r, cand, reimport, costs_here)
         REACH[cid] = r
 
     warm = None
     try:
-        warm = narrow_by_data(plans, reach, answers, tests, map_nums, unmapped, ms, run_cost_reimport, setup_cost,
+        warm = narrow_by_data(plans, reach, answers, tests, map_nums, unmapped, ms, run_cost, setup_cost,
                               by_num, ctx, t_start)
     except Exception as e:  # the static plans stand
         log("data diff failed: %r" % (e,))
@@ -247,6 +247,10 @@ def _diagnose(all_bins, ms, commits, plans):
             keep = {n for b in all_bins[cid] for n in b}
             full = cost(keep)
             wa += full - cost(keep - set(BLIND.get(cid, [])))
+            if os.environ.get("BR_DIAG_V"):
+                d = full - cost(keep - set(BLIND.get(cid, [])))
+                if d > 500:
+                    log("blindwaste %s %d %s" % (cid, d, sorted(((ms[n], n) for n in BLIND.get(cid, [])), reverse=True)[:6]))
             wb += full - cost(keep - set(UNRUN.get(cid, [])))
         log("diag4: blind %d ms, unrun %d ms" % (wa, wb))
         _encode(all_bins, ms, commits, int(round(wa / 1000.0)), min(1999, int(round(wb / 10.0))))
@@ -358,7 +362,7 @@ def narrow_by_data(plans, reach, answers, tests, map_nums, unmapped, ms, run_cos
     patched modules in a child, see which values changed, and keep only the tests
     that can see those values.  Returns the warm parent state, or None."""
     todo = []
-    for cid, (r, cand, reimport) in reach.items():
+    for cid, (r, cand, reimport, _rc) in reach.items():
         if not reimport or not r.py or r.data or not r.runnable:
             continue
         if any(p.startswith("tests/") for p, _t, _c in r.py):
@@ -392,7 +396,7 @@ def narrow_by_data(plans, reach, answers, tests, map_nums, unmapped, ms, run_cos
         if bits is None:
             log("%s data diff: %d entries, no narrowing" % (cid, len(entries)))
             continue
-        r, cand, reimport = reach[cid]
+        r, cand, reimport, run_cost = reach[cid]
         keep = set(unmapped)
         i = 0
         while bits:
