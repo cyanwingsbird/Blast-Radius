@@ -19,11 +19,12 @@ Picks the sqlglot tests a patch can break, and splits them across workers.
      tokenizer/parser/generator). The exception is a class that is
      instantiated while modules import (recorded with its ancestors). For
      those, every test that loads the module is in reach.
-   - An edit to a SQL fixture that changes a statement itself (not only spacing,
-     letter case, comments or settings lines), in a patch whose Python files
-     compile unchanged, is not verified when exactly one test reads that
-     fixture: such an edit all but always breaks that test, so the test is
-     scheduled as it is.
+   - An edit to a SQL fixture, in a patch whose Python files compile unchanged,
+     is not verified when exactly one test reads that fixture and an edited
+     statement no longer parses or parses to another tree: such an edit all but
+     always breaks that test, so the test is scheduled as it is. An edit that
+     parses to the same tree (a dropped optional keyword, spacing) is verified
+     like any other.
 2. **Verification** (`runner.py`). Candidate tests are run in the container
    against the patched code. The pinned sqlglot and its tests are imported
    once, and each commit gets a forked child. The child swaps in the changed

@@ -131,6 +131,7 @@ def main():
     answers = {}
     plans = {}
     reach = {}
+    fix_cand = {}
     for cid in commits:
         text = open(os.path.join(DATA, "commits", cid + ".patch"), encoding="utf-8", errors="replace").read()
         try:
@@ -159,11 +160,7 @@ def main():
             continue
         if r.data and len(cand) <= FIX_BLIND and r.runnable and not r.everything and \
                 all(_real_fixture_edit(p, t) for p, t in r.data) and _same_code(r):
-            # an edited fixture line and the one test that reads it: such an edit all but
-            # always breaks that test, so running it first costs more than it can save
-            answers[cid] = sorted(cand)
-            REACH[cid] = r
-            continue
+            fix_cand[cid] = sorted(cand)       # (decided below, once sqlglot is loaded)
         reimport = any(c is None for _p, _t, c in r.py) or _needs_reimport(r)
         # (an edited fixture changes the queries, so recorded duckdb results do not apply either)
         exec_setup = (r.data and not _sql_only(r.data)) or \
@@ -179,6 +176,18 @@ def main():
                               by_num, ctx, t_start)
     except Exception as e:  # the static plans stand
         log("data diff failed: %r" % (e,))
+
+    # an edited fixture statement and the one test that reads it: when the statement no
+    # longer parses, or parses to something else, the test all but always fails, and
+    # running it first costs more than it can save
+    try:
+        for cid, keep in fix_cand.items():
+            if cid in plans and plans[cid]["verify"] and all(_breaks_statement(p, t) for p, t in REACH[cid].data):
+                del plans[cid]
+                answers[cid] = keep
+                log("%s: broken fixture statement, %d test(s) scheduled unverified" % (cid, len(keep)))
+    except Exception as e:  # the plans stand
+        log("fixture check failed: %r" % (e,))
 
     jobs = []
     for cid, p in plans.items():
@@ -929,6 +938,50 @@ def _real_fixture_edit(path, text):
     except (OSError, UnicodeDecodeError):
         return False
     return _fixture_content(old_text) != _fixture_content(text)
+
+
+def _breaks_statement(path, text):
+    """True when an edited statement of this SQL fixture stopped parsing or parses to
+    another tree (so not: a dropped optional keyword, spacing, a statement that did
+    not parse in the default dialect to begin with)."""
+    if ROOT not in sys.path:
+        sys.path.insert(0, ROOT)
+    import sqlglot
+    with open(os.path.join(ROOT, path), encoding="utf-8") as f:
+        old_text = f.read()
+
+    def tree(sql):
+        sql = "\n".join(line for line in sql.splitlines() if not line.startswith("#")).strip()
+        if not sql:
+            return None
+        return sqlglot.parse_one(sql)
+
+    for split in (lambda s: _filter_comments(s).split(";"), lambda s: _filter_comments(s).splitlines()):
+        olds, news = split(old_text), split(text)
+        if len(olds) != len(news):
+            continue
+        pairs = [(o, n) for o, n in zip(olds, news) if o != n]
+        if not pairs:
+            continue
+        verdicts = []
+        for o, n in pairs:
+            try:
+                a = tree(o)
+            except Exception:
+                verdicts = None
+                break
+            if a is None:
+                verdicts = None
+                break
+            try:
+                b = tree(n)
+            except Exception:
+                verdicts.append(True)
+                continue
+            verdicts.append(a != b)
+        if verdicts is not None:
+            return any(verdicts)
+    return False
 
 
 def _same_code(r):
