@@ -858,14 +858,65 @@ def _limit_duckdb_threads():
     duckdb.connect = connect
 
 
+class _LazyModule(types.ModuleType):
+    """Stands in for pandas, which two test modules import and few tests use (it is a
+    quarter of the warm-up): the real package is imported the first time anything is
+    asked of it."""
+
+    def __getattr__(self, name):
+        if name.startswith("__") and not (name == "__path__" and self.__name__ == "pandas"):
+            raise AttributeError(name)      # (module scans: warning registries and the like)
+        real_pandas()
+        return getattr(importlib.import_module(self.__name__), name)
+
+
+def real_pandas():
+    """Put the real pandas in place of its stand-ins, here and in the test modules."""
+    stubs = [m for n, m in list(sys.modules.items()) if isinstance(m, _LazyModule)]
+    if not stubs:
+        return
+    for m in stubs:
+        sys.modules.pop(m.__name__, None)
+    if os.environ.get("BR_LAZY_LOG"):
+        with open(os.environ["BR_LAZY_LOG"], "a") as f:
+            f.write("pandas loaded in pid %d\n" % os.getpid())
+    real = importlib.import_module("pandas")
+    testing = importlib.import_module("pandas.testing")
+    for n, mod in list(sys.modules.items()):
+        if mod is not None and (n == "tests" or n.startswith("tests.")):
+            for k, v in list(vars(mod).items()):
+                if isinstance(v, _LazyModule):
+                    setattr(mod, k, testing if v.__name__ == "pandas.testing" else real)
+                elif v is _lazy_frame_equal:
+                    setattr(mod, k, testing.assert_frame_equal)
+
+
+def _lazy_frame_equal(*a, **k):
+    real_pandas()
+    return sys.modules["pandas.testing"].assert_frame_equal(*a, **k)
+
+
+def install_lazy_pandas():
+    if "pandas" in sys.modules:
+        return
+    top = _LazyModule("pandas")
+    sub = _LazyModule("pandas.testing")
+    sub.assert_frame_equal = _lazy_frame_equal
+    top.testing = sub
+    sys.modules["pandas"] = top
+    sys.modules["pandas.testing"] = sub
+
+
 class Warm:
     """State prepared once in the parent."""
 
-    def __init__(self, test_files, need_refs=False, exec_cache=True):
+    def __init__(self, test_files, need_refs=False, exec_cache=True, lazy_pandas=False):
         os.environ.setdefault("SKIP_INTEGRATION", "0")
         if ROOT not in sys.path:
             sys.path.insert(0, ROOT)
         os.chdir(ROOT)
+        if lazy_pandas:
+            install_lazy_pandas()
         # third-party modules the tests use
         for m in ("duckdb", "numpy", "pandas", "pandas.testing", "csv", "gzip", "decimal", "datetime"):
             try:
@@ -934,7 +985,8 @@ class Warm:
         self.exec_loaded = True
         try:
             self.exec_cache = _load_exec_cache() or _build_exec_cache()
-            _load_duck_cache()
+            if not isinstance(sys.modules.get("pandas"), _LazyModule):
+                _load_duck_cache()      # (data frames: only with the real pandas loaded)
         except Exception:
             self.exec_cache = None
 

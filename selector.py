@@ -212,7 +212,13 @@ def main():
         need_refs = any(p.get("reimport") for _c, p in jobs)
         if warm is None or (need_refs and warm.refs is None):
             warm = runner.Warm({by_num[n]["file"] for _c, p in jobs for n, _ in p["order"]}, need_refs=need_refs,
-                               exec_cache=False)
+                               exec_cache=False, lazy_pandas=LAZY_PANDAS)
+        # pandas itself only when a job runs a test that is known to use it: an executor
+        # test, or an optimizer test that hands duckdb's answers to pandas (run whole, or
+        # on the fixture items a code change reaches); a test that turns out to need it
+        # anyway imports it in its own process
+        if LAZY_PANDAS and any(_uses_pandas(cid, p, by_num) for cid, p in jobs):
+            runner.real_pandas()
         log("warm cpu %.2f, analysis cpu %.2f" % (time.process_time() - t_w, t_w))
         jobs.sort(key=lambda j: -j[1]["est"])
 
@@ -241,7 +247,7 @@ def main():
                               "dyn": {"ms": {n: ms[n] for n, _t in p["order"]},
                                       "rc": {n: p["rc"].get(n, 0.0) for n, _t in p["order"]},
                                       "kept": [ms[n] for n in p["blind"]]}})
-                       for cid, p in part], parallel=2, log=log, deadline=t_start + TIME_BUDGET))
+                       for cid, p in part], parallel=PARALLEL, log=log, deadline=t_start + TIME_BUDGET))
     WARM["warm"] = warm
     if os.environ.get("BR_DEBUG"):
         with open(os.environ["BR_DEBUG"], "a") as dbg:
@@ -494,7 +500,7 @@ def _diagnose(all_bins, ms, commits, plans):
         rows = []
         if jobs:
             warm = WARM.get("warm") or runner.Warm({t["file"] for t in tests}, need_refs=True)
-            res = runner.run_jobs(warm, jobs, parallel=2, log=log, deadline=time.time() + 120)
+            res = runner.run_jobs(warm, jobs, parallel=PARALLEL, log=log, deadline=time.time() + 120)
             for cid, job in jobs:
                 rr = res.get(cid, {})
                 keep = {n for b in all_bins[cid] for n in b}
@@ -691,6 +697,30 @@ def _calibrate():
 
 FIX_BLIND = int(os.environ.get("BR_FIX_BLIND", "0"))   # most tests a fixture-only change may leave unverified
 LATE_FILES = {"tests/test_sqlglotc.py"}
+PARALLEL = int(os.environ.get("BR_PAR", "2"))     # children at a time
+LAZY_PANDAS = int(os.environ.get("BR_LAZY_PANDAS", "0"))    # 2: not for filtered optimizer tests
+# the TestOptimizer tests that hand duckdb's answers to pandas (found by running each
+# one with the stand-in module in place)
+PANDAS_USERS = {"tests/test_optimizer.py::TestOptimizer::" + x for x in (
+    "test_canonicalize_internal_names", "test_eliminate_joins", "test_merge_subqueries", "test_optimize",
+    "test_optimize_joins", "test_qualify_columns", "test_simplify", "test_unnest_subqueries",
+    "test_tpch", "test_tpcds")}
+
+
+def _uses_pandas(cid, p, by_num):
+    r = REACH.get(cid)
+    code = r is None or bool(r.lines or r.classes or any(c is None for _p, _t, c in r.py)) or \
+        any(q.startswith("tests/") for q, _t, _c in r.py)
+    for n, tid in p["order"]:
+        t = by_num[n]
+        if isinstance(tid, str) and tid.startswith("PROBE:tpcds2:"):
+            continue
+        if t["file"] == "tests/test_executor.py":
+            if not (isinstance(tid, tuple) and tid[0] == "SETUP"):
+                return True
+        elif t["id"] in PANDAS_USERS and ((code and LAZY_PANDAS < 2) or not isinstance(tid, tuple)):
+            return True
+    return False
 DIFF_MIN = 0.8        # candidate CPU above which a data diff is worth its re-import
 DIFF_BUDGET = 25.0    # seconds from the start
 
@@ -724,10 +754,11 @@ def narrow_by_data(plans, reach, answers, tests, map_nums, unmapped, ms, run_cos
     # (the executor tables are loaded later, if a job turns out to need them)
     # (not tests/test_sqlglotc.py: it loads no sqlglot module, only setuptools, which costs
     # as much as all the other test modules together; a job that runs it imports it itself)
-    warm = runner.Warm({t["file"] for t in tests} - LATE_FILES, need_refs=True, exec_cache=False)
+    warm = runner.Warm({t["file"] for t in tests} - LATE_FILES, need_refs=True, exec_cache=False,
+                       lazy_pandas=LAZY_PANDAS)
     if os.environ.get("BR_PROF"):
         log("prof: warm done parent %.2f (before warm %.2f)" % (time.process_time(), t_w))
-    diffs = runner.run_diffs(warm, [(cid, reach[cid][0].py) for cid in todo], parallel=2,
+    diffs = runner.run_diffs(warm, [(cid, reach[cid][0].py) for cid in todo], parallel=PARALLEL,
                              deadline=t_start + DIFF_BUDGET)
     if os.environ.get("BR_PROF"):
         import resource
