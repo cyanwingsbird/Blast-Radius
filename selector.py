@@ -634,7 +634,7 @@ def plan(cid, cand, r, ms, run_cost, setup_cost, by_num, reimport, ctx):
         else:
             blind.append(n)
     run_cost = dict(run_cost)
-    alpha = float(os.environ.get("BR_ALPHA", "2.5"))
+    alpha = float(os.environ.get("BR_ALPHA", "1.25"))
     if alpha != 1.0:
         run_cost = {k: v * alpha for k, v in run_cost.items()}
     spec = {}
